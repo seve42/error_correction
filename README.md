@@ -1,6 +1,6 @@
 # 智卷 — 智能错题本生成系统
 
-基于大模型视觉理解 + LangChain Agent 的智能错题本生成系统。上传试卷 PDF 或图片，自动识别文档结构、智能分割题目、识别学生作答与红笔批改，导出为 Markdown 错题本并存入错题库。支持 AI 解题与教学讲解、笔记整理、独立 AI 对话、错题复习计划与数据统计。
+基于大模型视觉理解 + LangChain Agent 的智能错题本生成系统。上传试卷 PDF 或图片，自动识别文档结构、智能分割题目、识别学生作答与红笔批改，识别时自动生成知识点标签并支持一键生成答案解析，导出为 Markdown 错题本并存入错题库。支持 AI 解题与教学讲解、笔记整理、独立 AI 对话、错题复习计划与数据统计。
 
 ## 界面预览
 
@@ -23,8 +23,11 @@
 - **智能分割**：LLM Agent 自动识别题目边界，支持批次并行处理，跨页去重
 - **OCR 纠错**：LLM 对识别结果进行结构化纠错，还原原题格式
 - **视觉识别**：直接调用支持图像理解的 LLM，一次完成题目、手写作答与红笔批改标记的识别（原 PaddleOCR / 擦除模型保留为后端回退，前端默认不再使用）
-- **识别预览**：按页展示原图与题目、黑/蓝笔作答、红笔批改等识别结果，可逐项核对
-- **错题库**：SQLite 持久化存储，支持按科目、题型、知识点筛选和统计
+- **识别预览**：按页展示原图与题目、黑/蓝笔作答、红笔批改等识别结果，可逐项核对，并支持批量选择题目
+- **自动打标**：视觉识别同时为每道题生成 1-3 个知识点标签，优先复用已有标签池，入库后可按知识点筛选
+- **实时导入进度**：识别、分割与答案解析各阶段通过 SSE 实时推送进度，工作台展示分步日志与 AI 调用原始输出，长耗时任务可追踪、失败可定位
+- **答案解析**：导入流程第 4 步自动调用解题 Agent 生成标准答案与完整解析（区别于独立的「AI 解题」）
+- **错题库**：SQLite 持久化存储，支持按科目、题型、知识点筛选和统计，支持多选与批量删除
 - **笔记整理**：上传手写笔记图片，OCR + LLM 自动结构化整理为 Markdown
 - **AI 解题**：独立解题 Agent，逐步给出解题过程
 - **AI 教学**：教学讲解 Agent，绑定错题上下文的一对一辅导
@@ -47,6 +50,23 @@
    新增标准答案与解析生成能力，可对整理后的题目调用解题 Agent 输出标准答案和完整解析；识别链路保留题目配图引用，使题面、配图、答案与解析能够一起展示和导出。
 5. **优化 LaTeX 与 Markdown 展示**
    题目、答案与解析统一由富文本容器渲染：Markdown 与 LaTeX（MathJax）自动排版，HTML 内容经白名单净化后展示，修正公式、上下标、多行解析在题目卡片、详情弹窗与导出中的显示效果。
+6. **导入流程加入实时进度与并发处理**
+   新增进程内任务事件中心，上传、视觉识别、题目分割与答案解析各阶段通过 SSE（并提供轮询兜底）实时推送进度与 AI 原始输出；视觉识别默认 4 路并发、每批不超过 6 页，答案解析默认 3 路并发、每批 4 题，跨阶段日志可续接，长耗时导入不再黑屏等待。
+7. **题目自动打标**
+   视觉识别阶段为每道题生成 1-3 个知识点标签并优先复用已有标签池，入库时关联到标签表，错题库可按知识点筛选；此前该能力在视觉链路中回归丢失，已修复并补充了标签归一化与长度限制。
+8. **修复视觉识别长输出截断导致的识别变慢/失败**
+   整批试卷的 JSON 输出可能超过原 16K token 上限被截断，触发约 2 秒后的整批重试并反复失败。现将输出上限提高到 32K tokens，检测到截断（`finish_reason=length` 或未闭合 JSON）时自动拆批或切换紧凑提示重试，并增加识别心跳日志，长试卷识别耗时明显下降。
+9. **统一批量选择交互**
+   识别预览、错题库与分割历史复用同一套批量选择逻辑与选择条组件，支持多选、跨页全选与批量删除；后端新增批量删除接口与「按当前筛选返回全部题目 ID」接口。
+
+## 待办 / Roadmap
+
+已知待办与改进方向持续维护在 [TODO.md](TODO.md)，当前主要包括：
+
+- 更智能的标签生成、识别与管理系统
+- 跨页题目关联图片无法正常处理
+- 空间利用率更高的错题库 UI
+- 学科特化内容（如英语生词、语文文言文实词等）
 
 ## 项目结构
 
@@ -55,14 +75,21 @@
 │   ├── core/                        # 核心模块
 │   │   ├── config.py                # 集中配置（路径、Settings）
 │   │   ├── llm.py                   # LLM 初始化（多 provider 支持）
-│   │   ├── state.py                 # 全局会话状态（session_files、锁）
+│   │   ├── state.py                 # 全局会话状态（session_files、锁、文件顺序）
+│   │   ├── task_progress.py         # 导入任务进度事件中心（SSE / 轮询数据源）
+│   │   ├── workflow_run_store.py    # 分割运行记录存取适配层
+│   │   ├── quota.py / usage.py      # 点数额度与用量统计
 │   │   └── mail.py                  # SMTP 邮件发送
 │   ├── web_app.py                   # Flask 应用工厂 + Blueprint 注册
 │   ├── routes/                      # Flask Blueprint 路由（auth、chat、device、notes、projects 等）
-│   ├── src/                         # 核心模块（LangGraph workflow、OCR 客户端、工具函数）
+│   ├── pipeline/                    # 文档处理流程
+│   │   ├── workflow.py              # 分割 / 纠错主流程
+│   │   ├── vision_ocr_client.py     # 视觉大模型识别客户端（前端默认链路）
+│   │   ├── paddleocr_client.py      # PaddleOCR 回退客户端
+│   │   └── utils.py                 # 图片处理与配图整理
 │   ├── agents/                      # LangChain Agent
 │   │   ├── error_correction/        # 题目分割 + OCR 纠错
-│   │   ├── solve/                   # 解题 Agent
+│   │   ├── solve/                   # 解题 Agent（含导入时的答案解析）
 │   │   ├── teach/                   # 教学讲解 Agent
 │   │   └── note/                    # 笔记整理 Agent
 │   ├── db/                          # SQLite + SQLAlchemy ORM
@@ -75,9 +102,9 @@
 │   └── src/
 │       ├── views/                   # 页面级组件（HomeView、WorkspaceView）
 │       ├── components/              # 基础组件与业务组件
-│       ├── composables/             # 组合式函数（useAuth、useTheme 等）
+│       ├── composables/             # 组合式函数（useAuth、useTheme、useTaskProgress、useBatchSelection 等）
 │       ├── router/                  # Vue Router 路由配置
-│       ├── api/                     # 按领域拆分的 API 调用层
+│       ├── api/                     # 按领域拆分的 API 调用层（含任务进度 API）
 │       ├── utils/                   # 工具函数（Markdown 渲染、MathJax、DOMPurify）
 │       └── __tests__/               # 前端测试（Vitest）
 ├── example_uploads/                 # 示例测试文件
@@ -145,6 +172,9 @@ cd backend && python -m pytest tests/ -v
 
 # 前端测试
 cd frontend && npm test
+
+# 前端构建检查（类型检查 + 打包）
+cd frontend && npm run build
 ```
 
 详见 [backend/tests/README.md](backend/tests/README.md) 和 [frontend/src/__tests__/README.md](frontend/src/__tests__/README.md)。
