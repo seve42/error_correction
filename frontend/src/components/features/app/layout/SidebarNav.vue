@@ -338,7 +338,7 @@ const userQuotaSummary = computed(() => {
   const remaining = userQuota.value?.remaining
   const total = userQuota.value?.daily_free_quota
   if (remaining == null || total == null) return ''
-  return `今日剩余 ${remaining} / ${total} 额度`
+  return `今日剩余 ${remaining} / ${total} 点`
 })
 </script>
 
@@ -475,24 +475,8 @@ const userQuotaSummary = computed(() => {
                   <div class="overflow-hidden">
                     <div class="flex flex-col gap-1.5">
                       <template v-for="item in group.items" :key="item.id">
-                        <!-- 禁用项 -->
                         <BaseTooltip :text="item.label" placement="right" :disabled="!useNarrowLayout">
-                          <button v-if="item.disabled" disabled
-                            class="flex h-10 items-center justify-between rounded-lg px-3 py-0 text-sm cursor-not-allowed text-gray-400 dark:text-[#62666d]">
-                            <div
-                              class="flex items-center gap-3 transition-all duration-300 ease-[var(--sidebar-transition-timing)]">
-                              <i class="fa-solid w-4 shrink-0 text-center text-sm" :class="item.icon"></i>
-                              <span v-if="renderExpandedContent"
-                                class="overflow-hidden whitespace-nowrap transition-all duration-300 ease-[var(--sidebar-transition-timing)]"
-                                :class="useNarrowLayout ? 'max-w-0 -translate-x-1 opacity-0' : 'max-w-[96px] translate-x-0 opacity-100'">{{
-                                  item.label }}</span>
-                            </div>
-                            <span v-if="renderExpandedContent"
-                              class="overflow-hidden whitespace-nowrap rounded-md bg-gray-100 text-[10px] font-medium text-gray-500 transition-all duration-300 ease-[var(--sidebar-transition-timing)] dark:bg-white/[0.04] dark:text-[#62666d]"
-                              :class="useNarrowLayout ? 'max-w-0 px-0 py-0 opacity-0' : 'max-w-[68px] px-2 py-0.5 opacity-100'">敬请期待</span>
-                          </button>
-                          <!-- 普通项 -->
-                          <button v-else :ref="el => navBtnRefs[item.id] = el"
+                          <button :ref="el => navBtnRefs[item.id] = el"
                             @click="setView(item.id === 'workspace' ? lastWorkspaceView : item.id)"
                             class="sidebar-active-fade group relative z-10 flex items-center rounded-lg text-sm font-medium outline-none transition-all duration-300 ease-[var(--sidebar-transition-timing)]"
                             :class="[
@@ -537,24 +521,8 @@ const userQuotaSummary = computed(() => {
                   <div class="overflow-hidden">
                     <div class="flex flex-col gap-1.5">
                       <template v-for="item in group.items" :key="item.id">
-                        <!-- 禁用项 -->
                         <BaseTooltip :text="item.label" placement="right" :disabled="!useNarrowLayout">
-                          <button v-if="item.disabled" disabled
-                            class="flex h-10 items-center justify-between rounded-lg px-3 py-0 text-sm cursor-not-allowed text-gray-400 dark:text-[#62666d]">
-                            <div
-                              class="flex items-center gap-3 transition-all duration-300 ease-[var(--sidebar-transition-timing)]">
-                              <i class="fa-solid w-4 shrink-0 text-center text-sm" :class="item.icon"></i>
-                              <span v-if="renderExpandedContent"
-                                class="overflow-hidden whitespace-nowrap transition-all duration-300 ease-[var(--sidebar-transition-timing)]"
-                                :class="useNarrowLayout ? 'max-w-0 -translate-x-1 opacity-0' : 'max-w-[96px] translate-x-0 opacity-100'">{{
-                                  item.label }}</span>
-                            </div>
-                            <span v-if="renderExpandedContent"
-                              class="overflow-hidden whitespace-nowrap rounded-md bg-gray-100 text-[10px] font-medium text-gray-500 transition-all duration-300 ease-[var(--sidebar-transition-timing)] dark:bg-white/[0.04] dark:text-[#62666d]"
-                              :class="useNarrowLayout ? 'max-w-0 px-0 py-0 opacity-0' : 'max-w-[68px] px-2 py-0.5 opacity-100'">敬请期待</span>
-                          </button>
-                          <!-- 普通项 -->
-                          <button v-else :ref="el => navBtnRefs[item.id] = el"
+                          <button :ref="el => navBtnRefs[item.id] = el"
                             @click="setView(item.id === 'workspace' ? lastWorkspaceView : item.id)"
                             class="sidebar-active-fade group relative z-10 flex items-center rounded-lg text-sm font-medium outline-none transition-all duration-300 ease-[var(--sidebar-transition-timing)]"
                             :class="[

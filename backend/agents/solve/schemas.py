@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field
 class SolveResult(BaseModel):
     """单道题目的解题结果"""
     question_id: str = Field(description="题号")
-    answer: str = Field(description="最终答案（选择题填选项字母，填空题填答案，解答题填完整解答过程）")
+    answer: str = Field(
+        description="最终答案（选择题只填选项字母，填空题填填写内容，判断题填正确/错误，解答题填最终结论；完整过程放 reasoning）"
+    )
     reasoning: str = Field(description="解题思路与推理过程")
     confidence: float = Field(default=1.0, description="置信度 0-1，1 表示非常确定")
 

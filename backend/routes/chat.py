@@ -17,7 +17,6 @@ from db.models import (
 )
 from core.model_selection import LLMSelectionError, resolve_llm_selection
 from core.quota import (
-    consume_daily_free_quota,
     has_daily_free_quota,
     quota_exceeded_response,
     uses_server_llm_selection,
@@ -448,7 +447,6 @@ def stream_chat(session_id):
                 user_id=user_id,
                 provider=model_provider,
             )
-            quota_user_id = user_id
             if should_consume_quota:
                 quota_user = crud.get_user_by_id(db, user_id)
                 if not quota_user:
@@ -480,49 +478,59 @@ def stream_chat(session_id):
             chat_session_id = chat_session.id
 
         def generate():
+            from core.usage import start_usage, end_usage, record_fallback_usage
+
+            usage_ctx = start_usage(
+                user_id,
+                "chat",
+                provider_source=selection["source"],
+                system_stages={"llm"} if should_consume_quota else set(),
+            )
             full_response = []
             full_reasoning = []
             try:
-                for chunk in stream_teach(
-                    question=q_data,
-                    messages=history,
-                    provider=model_provider,
-                    model_name=selection["model_name"],
-                    deep_think=deep_think,
-                    context_prompt=context_prompt,
-                ):
-                    # stream_teach 现在 yield dict: {"type": "reasoning"|"content", "content": "..."}
-                    if isinstance(chunk, dict):
-                        if chunk["type"] == "reasoning":
-                            full_reasoning.append(chunk["content"])
-                            yield f"data: {json.dumps({'reasoning': chunk['content']}, ensure_ascii=False)}\n\n"
-                        else:
-                            full_response.append(chunk["content"])
-                            yield f"data: {json.dumps({'token': chunk['content']}, ensure_ascii=False)}\n\n"
-                    else:
-                        # 兼容旧格式（纯字符串）
-                        full_response.append(chunk)
-                        yield f"data: {json.dumps({'token': chunk}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                logger.exception("流式对话错误")
-                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
-
-            # 保存完整的 assistant 回复（思考过程不保存到消息历史）
-            assistant_content = "".join(full_response)
-            if assistant_content:
                 try:
-                    with SessionLocal() as db:
-                        crud.add_chat_message(
-                            db, chat_session_id, "assistant", assistant_content
-                        )
-                        if should_consume_quota and quota_user_id:
-                            quota_user = crud.get_user_by_id(db, quota_user_id)
-                            if quota_user:
-                                consume_daily_free_quota(db, quota_user, action_type="chat")
+                    for chunk in stream_teach(
+                        question=q_data,
+                        messages=history,
+                        provider=model_provider,
+                        model_name=selection["model_name"],
+                        deep_think=deep_think,
+                        context_prompt=context_prompt,
+                    ):
+                        # stream_teach 现在 yield dict: {"type": "reasoning"|"content", "content": "..."}
+                        if isinstance(chunk, dict):
+                            if chunk["type"] == "reasoning":
+                                full_reasoning.append(chunk["content"])
+                                yield f"data: {json.dumps({'reasoning': chunk['content']}, ensure_ascii=False)}\n\n"
+                            else:
+                                full_response.append(chunk["content"])
+                                yield f"data: {json.dumps({'token': chunk['content']}, ensure_ascii=False)}\n\n"
+                        else:
+                            # 兼容旧格式（纯字符串）
+                            full_response.append(chunk)
+                            yield f"data: {json.dumps({'token': chunk}, ensure_ascii=False)}\n\n"
                 except Exception as e:
-                    logger.error(f"保存 assistant 回复失败: {e}")
+                    logger.exception("流式对话错误")
+                    yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
-            yield f"data: {json.dumps({'done': True})}\n\n"
+                # 保存完整的 assistant 回复（思考过程不保存到消息历史）
+                assistant_content = "".join(full_response)
+                if assistant_content:
+                    try:
+                        with SessionLocal() as db:
+                            crud.add_chat_message(
+                                db, chat_session_id, "assistant", assistant_content
+                            )
+                    except Exception as e:
+                        logger.error(f"保存 assistant 回复失败: {e}")
+
+                if should_consume_quota and assistant_content:
+                    record_fallback_usage(model_provider, selection["model_name"])
+
+                yield f"data: {json.dumps({'done': True})}\n\n"
+            finally:
+                end_usage(usage_ctx)
 
         resp = Response(generate(), mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache"

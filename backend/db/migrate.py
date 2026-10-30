@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from werkzeug.security import generate_password_hash
 
+from core.config import settings
 from db import SessionLocal, crud, engine
 from db.models import Base
 
@@ -206,6 +207,7 @@ def migrate():
         _add_column_if_missing(conn, "questions", "review_interval_days", "INTEGER", 0)
         _add_column_if_missing(conn, "questions", "review_count", "INTEGER", 0)
         _add_column_if_missing(conn, "questions", "ease_factor", "FLOAT", 2.5)
+        _add_column_if_missing(conn, "questions", "page_image_ref", "TEXT")
         _add_column_if_missing(conn, "notes", "project_id", "INTEGER")
         _add_column_if_missing(conn, "split_records", "original_images_json", "TEXT")
         _add_column_if_missing(conn, "notes", "review_due_at", "DATETIME")
@@ -244,31 +246,33 @@ def migrate():
         if project_rows or rows:
             db.commit()
 
+    # 本地单用户部署：仅初始化唯一的本地管理员账号（已存在时跳过）。
+    # 这里不再创建 admin@admin.com / admin2@admin.com 等弱口令内置账号。
     default_users = [
         {
-            "email": "admin@admin.com",
-            "username": "Admin",
-            "password": "123456",
-            "is_admin": True,
-        },
-        {
-            "email": "admin2@admin.com",
-            "username": "Admin2",
-            "password": "123456",
+            "email": "dreamer-seve@outlook.com",
+            "username": "seve",
+            "password": "2147483647",
             "is_admin": True,
         },
     ]
     with SessionLocal() as db:
         for user in default_users:
             if not crud.get_user_by_email(db, user["email"]):
-                crud.create_user(
+                created = crud.create_user(
                     db,
                     email=user["email"],
                     password_hash=generate_password_hash(user["password"]),
                     username=user["username"],
                     is_admin=user["is_admin"],
                 )
-                print(f"[migrate] created default user: {user['username']} ({user['email']})")
+                created.display_name = user["username"]
+                created.daily_free_quota = settings.daily_free_quota
+                db.commit()
+                print(
+                    "[migrate] created local user: "
+                    f"{user['username']} ({user['email']})"
+                )
 
     from db.models import User
 

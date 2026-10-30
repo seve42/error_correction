@@ -5,7 +5,8 @@
  */
 import { ref, computed } from 'vue'
 import BaseCard from '@/components/base/BaseCard.vue'
-import { isHtml, sanitizeHtml, formatOption } from '@/utils/index'
+import RichContent from '@/components/features/app/shared/RichContent.vue'
+import { formatOption } from '@/utils/index'
 
 const props = defineProps({
   question: { type: Object, required: true },
@@ -71,6 +72,24 @@ const saveUserAnswer = () => {
   editingUserAnswer.value = false
 }
 const cancelUserAnswer = () => { editingUserAnswer.value = false }
+
+// 判分结论徽章文案与配色，未知结论统一按“待确认”展示。
+const verdictMeta: Record<string, { label: string; class: string }> = {
+  correct: { label: '正确', class: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300' },
+  wrong: { label: '错误', class: 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300' },
+  partial: { label: '部分正确', class: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300' },
+  unknown: { label: '待确认', class: 'bg-slate-100 text-slate-600 dark:bg-white/10 dark:text-slate-300' },
+}
+
+// 视觉 OCR 新增的判分字段均为可选，旧题没有时对应区块整体隐藏。
+const grading = computed(() => props.question.grading || null)
+const gradingVerdict = computed(() => verdictMeta[String(grading.value?.verdict || 'unknown')] || verdictMeta.unknown)
+const gradingBlanks = computed(() => (Array.isArray(grading.value?.blanks) ? grading.value.blanks : []))
+const gradingMarks = computed(() => (Array.isArray(grading.value?.marks) ? grading.value.marks : []))
+const redMarks = computed(() => (Array.isArray(props.question.red_marks) ? props.question.red_marks : []))
+const allMarks = computed(() => [...gradingMarks.value, ...redMarks.value].filter((m) => m && (m.type || m.text)))
+const hasGrading = computed(() => Boolean(grading.value || redMarks.value.length))
+const blankVerdictLabel = (verdict) => verdictMeta[String(verdict || '')]?.label || verdict || ''
 </script>
 
 <template>
@@ -123,12 +142,9 @@ const cancelUserAnswer = () => { editingUserAnswer.value = false }
     <div class="question-content relative">
       <template v-if="question.content_blocks?.length">
         <div v-for="(b, i) in question.content_blocks" :key="i">
-          <div v-if="b.block_type === 'text' && isHtml(b.content)"
+          <RichContent v-if="b.block_type === 'text'"
             class="my-4 text-base font-medium leading-relaxed text-gray-800 dark:text-[#d0d6e0]"
-            v-html="sanitizeHtml(b.content)"></div>
-          <p v-else-if="b.block_type === 'text'"
-            class="my-4 text-base font-medium leading-relaxed text-gray-800 dark:text-[#d0d6e0] whitespace-pre-wrap">{{
-              b.content }}</p>
+            :content="b.content" />
           <img v-else-if="b.block_type === 'image' && b.content" :src="b.content"
             class="my-6 max-h-[400px] cursor-zoom-in rounded-xl border border-gray-100 dark:border-white/5 shadow-sm transition-transform hover:scale-[1.01]"
             @click.stop="() => emit('open-image', b.content)" />
@@ -149,10 +165,77 @@ const cancelUserAnswer = () => { editingUserAnswer.value = false }
           <span
             class="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-white text-[10px] shadow-sm dark:bg-[#15151e]">{{
               formatOption(opt)[0] }}</span>
-          <span class="flex-1">{{ formatOption(opt).slice(2) }}</span>
+          <RichContent class="flex-1" :content="formatOption(opt).slice(2)" />
           <img v-if="optionImages?.[idx]" :src="optionImages[idx]"
             class="max-h-[100px] max-w-[160px] shrink-0 cursor-zoom-in rounded-lg border border-gray-100 object-contain dark:border-white/5"
             @click.stop="() => emit('open-image', optionImages[idx])" />
+        </div>
+      </div>
+
+      <!-- 整页原图：视觉 OCR 时保留原始页面，便于核对裁剪区域 -->
+      <div v-if="question.page_image" class="mt-8">
+        <div
+          class="mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+          <i class="fa-regular fa-image"></i>
+          <span>整页原图</span>
+        </div>
+        <img :src="question.page_image"
+          class="max-h-[240px] max-w-full cursor-zoom-in rounded-xl border border-gray-100 object-contain shadow-sm transition-transform hover:scale-[1.01] dark:border-white/5"
+          @click.stop="() => emit('open-image', question.page_image)" />
+      </div>
+
+      <!-- 我的答案：视觉 OCR 汇总的黑/蓝笔作答，旧题没有该字段时隐藏 -->
+      <div v-if="question.student_answer"
+        class="mt-8 rounded-xl border border-gray-100 bg-gray-50/60 p-4 dark:border-white/5 dark:bg-white/[0.03]">
+        <div
+          class="mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+          <i class="fa-solid fa-pen-to-square"></i>
+          <span>我的答案</span>
+        </div>
+        <RichContent class="text-sm leading-relaxed text-gray-700 dark:text-[#d0d6e0]"
+          :content="question.student_answer" />
+      </div>
+
+      <!-- 红笔批改：判分结论 + 空位明细 + 标注原文 -->
+      <div v-if="hasGrading"
+        class="mt-3 rounded-xl border border-rose-100 bg-rose-50/50 p-4 dark:border-rose-500/15 dark:bg-rose-500/[0.06]">
+        <div
+          class="mb-2 flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+          <i class="fa-solid fa-pen"></i>
+          <span>红笔批改</span>
+          <span v-if="grading"
+            class="rounded-full px-2 py-0.5 text-[10px] font-bold normal-case tracking-normal"
+            :class="gradingVerdict.class">
+            {{ gradingVerdict.label }}
+          </span>
+        </div>
+        <RichContent v-if="grading?.annotation" class="text-sm leading-relaxed text-gray-700 dark:text-[#d0d6e0]"
+          :content="grading.annotation" />
+
+        <!-- 填空/小问逐项明细 -->
+        <div v-if="gradingBlanks.length" class="mt-3 space-y-1.5">
+          <div v-for="(blank, i) in gradingBlanks" :key="'blank-' + i"
+            class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-gray-600 dark:text-[#aeb6c2]">
+            <span class="font-bold text-gray-500 dark:text-gray-400">{{ blank.blank_id || `空${i + 1}` }}</span>
+            <span v-if="blank.printed_hint" class="text-gray-400 dark:text-[#62666d]">题干：<RichContent inline
+                :content="blank.printed_hint" /></span>
+            <span v-if="blank.answer">作答：<RichContent inline :content="blank.answer" /></span>
+            <span v-if="blank.verdict"
+              class="rounded bg-white/70 px-1.5 py-0.5 text-[10px] font-bold dark:bg-white/10">{{
+                blankVerdictLabel(blank.verdict) }}</span>
+            <RichContent v-if="blank.annotation" class="w-full text-gray-500 dark:text-[#8a8f98]"
+              :content="blank.annotation" />
+          </div>
+        </div>
+
+        <!-- 红笔标注原文（grading.marks 与 red_marks 合并展示） -->
+        <div v-if="allMarks.length" class="mt-3 flex flex-wrap gap-2">
+          <span v-for="(mark, i) in allMarks" :key="'mark-' + i"
+            class="inline-flex items-center gap-1 rounded-lg bg-white/70 px-2 py-1 text-xs text-gray-600 dark:bg-white/[0.06] dark:text-[#aeb6c2]">
+            <span v-if="mark.type"
+              class="text-[10px] font-bold uppercase tracking-wide text-rose-500 dark:text-rose-300">{{ mark.type }}</span>
+            <RichContent v-if="mark.text" inline :content="mark.text" />
+          </span>
         </div>
       </div>
     </div>

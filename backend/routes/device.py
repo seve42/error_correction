@@ -36,10 +36,15 @@ def _ocr_cache_path(user_id: Optional[int]) -> str:
 
 
 def _clear_ocr_cache(user_id: Optional[int]) -> None:
-    try:
-        os.remove(_ocr_cache_path(user_id))
-    except FileNotFoundError:
-        pass
+    import glob
+
+    key = str(user_id) if user_id is not None else "anon"
+    pattern = os.path.join(str(settings.results_dir), f"ocr_cache_{key}*.json")
+    for cache_path in glob.glob(pattern):
+        try:
+            os.remove(cache_path)
+        except FileNotFoundError:
+            pass
 
 
 def _clear_workbench_references(user_id: Optional[int]) -> None:

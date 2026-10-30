@@ -13,7 +13,7 @@ const { pushToast } = useToast()
 
 const props = defineProps({
   open: { type: Boolean, default: false },
-  type: { type: String, default: 'openai' }, // 'openai' | 'anthropic' | 'paddleocr'
+  type: { type: String, default: 'openai' }, // 'openai' | 'anthropic'
   editData: { type: Object, default: null }, // null=新增, object=编辑
 })
 
@@ -50,20 +50,6 @@ const typeConfig = computed(() => ({
     secretPlaceholder: '输入 API Key',
     urlLabel: 'Base URL',
   },
-  paddleocr: {
-    title: isEdit.value ? '编辑 PaddleOCR 服务' : '添加 PaddleOCR 服务',
-    iconBg: 'bg-gray-50 dark:bg-white/[0.04] border border-gray-100 dark:border-white/[0.08]',
-    iconCls: 'fa-eye text-slate-600 dark:text-slate-400',
-    imgIcon: '/src/assets/provider-paddleocr.svg',
-    btnCls: 'bg-slate-900 hover:bg-slate-800 text-white dark:bg-[#f7f8f8] dark:hover:bg-white dark:text-[#1b1b1d]',
-    namePlaceholder: '例如：PaddleOCR 官方',
-    urlPlaceholder: 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs',
-    modelPlaceholder: 'PaddleOCR-VL-1.5',
-    defaultName: 'PaddleOCR',
-    secretLabel: 'API Token',
-    secretPlaceholder: '输入 API Token',
-    urlLabel: 'API URL',
-  },
 }[props.type]))
 
 const defaultForm = () => ({
@@ -73,10 +59,6 @@ const defaultForm = () => ({
   model_name: '',
   light_model_name: '',
   supports_function_calling: true,
-  // PaddleOCR 专用
-  use_doc_orientation: false,
-  use_doc_unwarping: false,
-  use_chart_recognition: false,
 })
 
 const form = ref(defaultForm())
@@ -87,7 +69,6 @@ const fetchingModels = ref(false)
 const fetchModelError = ref('')
 
 const canFetchModels = computed(() => {
-  if (props.type === 'paddleocr') return false
   // 需要有 API Key（新输入或已设置）
   const hasKey = form.value.api_key || (props.editData?.api_key_set)
   return !!hasKey
@@ -140,7 +121,6 @@ watch(() => props.open, (v) => {
   modelList.value = []
   fetchModelError.value = ''
   openDropdown.value = null
-  testResult.value = null
   if (props.editData) {
     form.value = {
       ...defaultForm(),
@@ -150,51 +130,11 @@ watch(() => props.open, (v) => {
       model_name: props.editData.model_name || '',
       light_model_name: props.editData.light_model_name || '',
       supports_function_calling: props.editData.supports_function_calling ?? true,
-      use_doc_orientation: props.editData.use_doc_orientation || false,
-      use_doc_unwarping: props.editData.use_doc_unwarping || false,
-      use_chart_recognition: props.editData.use_chart_recognition || false,
     }
   } else {
     form.value = defaultForm()
   }
 })
-
-// PaddleOCR 连接测试
-const testingConnection = ref(false)
-const testResult = ref(null) // { success: boolean, message: string } | null
-
-const canTestConnection = computed(() => {
-  const hasToken = form.value.api_key || (props.editData?.api_key_set)
-  const hasUrl = form.value.base_url
-  return !!hasToken && !!hasUrl
-})
-
-const testConnection = async () => {
-  if (testingConnection.value) return
-  testingConnection.value = true
-  testResult.value = null
-  try {
-    const payload = {
-      api_token: form.value.api_key || undefined,
-      api_url: form.value.base_url || undefined,
-      provider_id: props.editData?.id || undefined,
-    }
-    const res = await fetch('/api/paddleocr/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    const data = await res.json()
-    testResult.value = {
-      success: data.success,
-      message: data.success ? data.message : data.error,
-    }
-  } catch (e) {
-    testResult.value = { success: false, message: e.message || '请求失败' }
-  } finally {
-    testingConnection.value = false
-  }
-}
 
 const confirm = () => {
   if (!form.value.name.trim()) {
@@ -237,9 +177,7 @@ const selectOption = (field, value) => {
 
     <form autocomplete="off" class="space-y-4" @submit.prevent="confirm" @click="openDropdown = null">
       <div>
-        <label class="mb-1.5 block text-xs font-bold text-slate-600 dark:text-slate-400">{{ type === 'paddleocr' ?
-          '服务名称' :
-          '供应商名称' }}</label>
+        <label class="mb-1.5 block text-xs font-bold text-slate-600 dark:text-slate-400">供应商名称</label>
         <BaseInput v-model="form.name" type="text" autocomplete="one-time-code"
           :placeholder="typeConfig.namePlaceholder" inputClass="h-10" autofocus />
       </div>
@@ -259,8 +197,8 @@ const selectOption = (field, value) => {
           :placeholder="typeConfig.urlPlaceholder" inputClass="h-10" />
       </div>
 
-      <!-- 获取模型列表按钮（仅 OpenAI / Anthropic） -->
-      <div v-if="type !== 'paddleocr'" class="flex items-center gap-3">
+      <!-- 获取模型列表按钮 -->
+      <div class="flex items-center gap-3">
         <BaseButton variant="secondary" @click="fetchModels" :disabled="!canFetchModels || fetchingModels"
           class="!h-8 !px-3 !text-[11px] !rounded-lg">
           <i class="fa-solid text-[10px]" :class="fetchingModels ? 'fa-circle-notch fa-spin' : 'fa-arrows-rotate'"></i>
@@ -272,8 +210,8 @@ const selectOption = (field, value) => {
       <div class="grid gap-4" :class="type === 'openai' ? 'sm:grid-cols-2' : ''">
         <div>
           <label class="mb-1.5 flex items-center gap-1.5 text-xs font-bold text-slate-600 dark:text-slate-400">
-            {{ type === 'paddleocr' ? 'OCR 模型' : '模型(可多选)' }}
-            <span v-if="type !== 'paddleocr'" class="group relative">
+            {{ '模型(可多选)' }}
+            <span class="group relative">
               <i
                 class="fa-solid fa-circle-info cursor-help text-slate-400 transition-colors hover:text-blue-500 dark:text-slate-500"></i>
               <span
@@ -283,7 +221,7 @@ const selectOption = (field, value) => {
             </span>
           </label>
           <!-- 有模型列表时用自定义下拉 -->
-          <div v-if="modelList.length > 0 && type !== 'paddleocr'" class="relative">
+          <div v-if="modelList.length > 0" class="relative">
             <button type="button" @click.stop="toggleDropdown('model_name')"
               class="flex w-full items-center justify-between rounded-xl border border-slate-200/80 bg-white/70 px-4 py-2.5 text-left text-sm transition-colors dark:border-white/10 dark:bg-slate-800/60"
               :class="form.model_name ? 'text-slate-800 dark:text-slate-200' : 'text-slate-400 dark:text-slate-500'">
@@ -308,7 +246,7 @@ const selectOption = (field, value) => {
           </div>
           <!-- 无模型列表时用 input -->
           <BaseInput v-else v-model="form.model_name" type="text"
-            :placeholder="type === 'paddleocr' ? 'e.g. PaddleOCR-VL-1.5' : 'e.g. gpt-4o, deepseek-chat'"
+            placeholder="e.g. gpt-4o, deepseek-chat"
             inputClass="h-10" />
         </div>
         <div v-if="type === 'openai'">
@@ -371,46 +309,6 @@ const selectOption = (field, value) => {
               :class="form.supports_function_calling ? 'translate-x-5' : 'translate-x-0'"></span>
           </button>
         </label>
-      </div>
-
-      <!-- PaddleOCR 测试连接 -->
-      <div v-if="type === 'paddleocr'" class="flex items-center gap-3">
-        <BaseButton variant="secondary" @click="testConnection" :disabled="!canTestConnection || testingConnection"
-          class="!h-8 !px-3 !text-[11px] !rounded-lg">
-          <i class="fa-solid text-[10px]"
-            :class="testingConnection ? 'fa-circle-notch fa-spin' : 'fa-plug-circle-check'"></i>
-          {{ testingConnection ? '检测中...' : '测试连接' }}
-        </BaseButton>
-        <span v-if="testResult?.success" class="text-xs font-medium text-emerald-600 dark:text-emerald-400">
-          <i class="fa-solid fa-circle-check mr-1"></i>{{ testResult.message }}
-        </span>
-        <span v-else-if="testResult && !testResult.success"
-          class="text-xs font-medium text-rose-500 dark:text-rose-400">
-          <i class="fa-solid fa-circle-xmark mr-1"></i>{{ testResult.message }}
-        </span>
-        <span v-else-if="!canTestConnection" class="text-xs text-slate-400 dark:text-slate-500">请先填写 API Token 和
-          URL</span>
-      </div>
-
-      <!-- PaddleOCR 功能开关 -->
-      <div v-if="type === 'paddleocr'" class="border-t border-slate-100 pt-4 dark:border-white/5">
-        <p class="mb-3 text-xs font-bold text-slate-600 dark:text-slate-400">功能开关</p>
-        <div class="space-y-3">
-          <label v-for="toggle in [
-            { key: 'use_doc_orientation', label: '文档方向检测' },
-            { key: 'use_doc_unwarping', label: '文档去畸变' },
-            { key: 'use_chart_recognition', label: '图表识别' },
-          ]" :key="toggle.key" class="flex cursor-pointer items-center justify-between">
-            <span class="text-sm font-medium text-slate-700 dark:text-slate-300">{{ toggle.label }}</span>
-            <button type="button" @click="form[toggle.key] = !form[toggle.key]"
-              class="relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none"
-              :class="form[toggle.key] ? 'bg-slate-900 dark:bg-[#f7f8f8]' : 'bg-slate-200 dark:bg-white/10'">
-              <span
-                class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out dark:bg-[#0A0A0F]"
-                :class="form[toggle.key] ? 'translate-x-5' : 'translate-x-0'"></span>
-            </button>
-          </label>
-        </div>
       </div>
     </form>
 

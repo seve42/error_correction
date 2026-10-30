@@ -1,4 +1,4 @@
-﻿"""
+"""
 错题本生成工作流 - LangGraph 实现
 使用 StateGraph 将每个处理步骤定义为图节点
 """
@@ -7,8 +7,10 @@ import os
 import re as _re
 import json
 import logging
+import shutil
 import time
 import traceback
+import uuid
 import difflib as _difflib
 from contextvars import copy_context
 from typing import List, Dict, Any, TypedDict, Optional
@@ -17,7 +19,13 @@ from rich.console import Console
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from core.config import settings
-from .utils import prepare_input, export_wrongbook, simplify_ocr_results, run_async
+from .utils import (
+    QUESTION_IMAGE_URL_PREFIX,
+    prepare_input,
+    export_wrongbook,
+    simplify_ocr_results,
+    run_async,
+)
 
 _HTML_TAG_RE = _re.compile(r"<[^>]+>")
 console = Console()
@@ -51,6 +59,8 @@ class WorkflowState(TypedDict, total=False):
     # 数据库凭据（由路由层注入，避免环境变量依赖）
     llm_credentials: Dict[str, Any]      # {api_key, base_url, light_model_name, supports_function_calling}
     ocr_credentials: Dict[str, Any]      # {api_url, token, model, use_doc_orientation, ...}
+    vision_credentials: Dict[str, Any]   # {api_key, base_url, model} 视觉 OCR 凭据
+    ocr_engine: str                      # "vision" | "paddleocr"
     ocr_cache_path: str                  # OCR 预览缓存文件路径（按用户隔离）
     results_dir: str                     # 本次运行的结果目录（按 user/run 隔离）
 
@@ -654,18 +664,200 @@ def _sort_key(qid: str):
         return (1, 0, qid)
 
 
-def split_questions_node(state: WorkflowState) -> dict:
-    """节点: 并行 OCR + 分割题目
+# 裁剪区域小于该像素数时视为无效配图（噪点、误标）
+FIGURE_MIN_CROP_PX = 8
 
-    不再依赖编排智能体的顺序处理，而是直接执行：
-    1. OCR 解析（PaddleOCR，图片级并行）
-    2. 构建重叠批次（2页/批，1页重叠）
-    3. 并行调用 split_batch（批次级并行，每批独立的内层 agent）
-    4. 按 question_id 去重（重叠页产生的重复题目）
-    5. 保存结果
+
+def _crop_question_figures(question: Dict[str, Any], page_image: str, image_dir: str, subdir: str) -> List[str]:
+    """按 figures.bbox（相对整页 0-1000）从整页图裁剪图形，返回可访问 URL 列表。"""
+    from PIL import Image
+
+    urls: List[str] = []
+    if not page_image or not os.path.isfile(page_image):
+        return urls
+    try:
+        with Image.open(page_image) as image:
+            width, height = image.size
+            for index, figure in enumerate(question.get("figures") or []):
+                bbox = figure.get("bbox") or []
+                if len(bbox) != 4:
+                    continue
+                left = max(int(round(bbox[0] / 1000 * width)), 0)
+                top = max(int(round(bbox[1] / 1000 * height)), 0)
+                right = min(int(round(bbox[2] / 1000 * width)), width)
+                bottom = min(int(round(bbox[3] / 1000 * height)), height)
+                if right - left < FIGURE_MIN_CROP_PX or bottom - top < FIGURE_MIN_CROP_PX:
+                    continue
+                crop = image.crop((left, top, right, bottom))
+                if crop.mode not in ("RGB", "L"):
+                    crop = crop.convert("RGB")
+                name = f"figure_{index + 1}_{uuid.uuid4().hex[:8]}.jpg"
+                crop.save(os.path.join(image_dir, name), format="JPEG", quality=90)
+                urls.append(f"{QUESTION_IMAGE_URL_PREFIX}{subdir}/{name}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("裁剪题目配图失败（%s）: %s", page_image, exc)
+    return urls
+
+
+def _materialize_question_images(questions: List[Dict[str, Any]], pages: List[Dict[str, Any]]) -> None:
+    """把每题配图落地到持久目录：图形裁剪 + 整页原图。
+
+    bbox 为相对整页的 0-1000 归一化坐标；裁剪失败时降级为只保留整页图。
     """
-    console.print("[bold yellow]步骤 2: 并行 OCR + 分割题目[/bold yellow]")
+    if not questions or not pages:
+        return
+    root = str(settings.question_images_dir)
+    os.makedirs(root, exist_ok=True)
+    page_by_index = {
+        page.get("page_index", 0): page for page in pages if isinstance(page, dict)
+    }
+
+    for question in questions:
+        page = page_by_index.get(question.get("page_index", 0))
+        if not page:
+            continue
+        subdir = uuid.uuid4().hex
+        image_dir = os.path.join(root, subdir)
+        os.makedirs(image_dir, exist_ok=True)
+
+        page_image = page.get("image_path") or ""
+        page_url = None
+        if page_image and os.path.isfile(page_image):
+            page_name = f"page_{uuid.uuid4().hex[:8]}.jpg"
+            try:
+                shutil.copyfile(page_image, os.path.join(image_dir, page_name))
+                page_url = f"{QUESTION_IMAGE_URL_PREFIX}{subdir}/{page_name}"
+            except OSError as exc:
+                logger.warning("保存整页图失败（%s）: %s", page_image, exc)
+
+        figure_urls = _crop_question_figures(question, page_image, image_dir, subdir)
+        if not page_url and not figure_urls:
+            shutil.rmtree(image_dir, ignore_errors=True)
+            continue
+
+        # 裁剪图以 image content_block 追加在原有文本块之后
+        blocks = question.setdefault("content_blocks", [])
+        refs = list(question.get("image_refs") or [])
+        for url in figure_urls:
+            blocks.append({"block_type": "image", "content": url})
+            if url not in refs:
+                refs.append(url)
+        question["image_refs"] = refs or None
+        if page_url:
+            question["page_image"] = page_url
+        if figure_urls:
+            question["has_image"] = True
+
+
+def _split_questions_vision(state: WorkflowState) -> dict:
+    """视觉 OCR 分支：一次请求（可多页）直接得到带笔迹标签的题目结构。
+
+    与 PaddleOCR 分支的区别：
+    - 不再按 2 页重叠批次调用 split_batch，题目结构由视觉模型一次给出；
+    - 题目可选携带 student_answer / grading / red_marks，供前端与导出使用；
+    - OCR 预览结果（pages + questions）由 /api/ocr 写入缓存，本函数优先复用。
+    """
+    results_dir = state.get("results_dir") or settings.results_dir
+    os.makedirs(results_dir, exist_ok=True)
+    questions_file = os.path.join(results_dir, "questions.json")
+    meta_path = os.path.join(results_dir, "split_metadata.json")
+    for path in (questions_file, meta_path):
+        if os.path.exists(path):
+            os.remove(path)
+
+    file_paths = state.get("image_paths") or state.get("file_paths") or []
+    result = None
+    ocr_cache_path = state.get("ocr_cache_path") or ""
+    if ocr_cache_path and os.path.exists(ocr_cache_path):
+        try:
+            with open(ocr_cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if (
+                isinstance(cached, dict)
+                and cached.get("engine") == "vision"
+                and int(cached.get("schema_version") or 0) == 2
+            ):
+                result = cached
+                os.remove(ocr_cache_path)
+                console.print(f"[green][OK] 使用视觉 OCR 缓存: {len(result.get('pages') or [])} 页[/green]")
+                logger.info("使用视觉 OCR 缓存: %s 页", len(result.get("pages") or []))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取视觉 OCR 缓存失败: %s，将重新识别", exc)
+
+    if result is None:
+        creds = state.get("vision_credentials") or {}
+        if not creds.get("api_key"):
+            return {
+                "questions": [],
+                "warnings": ["步骤 2 失败：未配置支持图像理解的模型，请前往设置页配置支持图像理解的模型"],
+            }
+        from pipeline.vision_ocr_client import VisionOCRClient
+
+        console.print(f"[cyan]视觉识别 {len(file_paths)} 个文件...[/cyan]")
+        started = time.time()
+        try:
+            result = VisionOCRClient(
+                api_key=creds.get("api_key"),
+                base_url=creds.get("base_url") or "",
+                model=creds.get("model") or "deepseek-flash",
+            ).parse_document(file_paths, output_dir=results_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("视觉 OCR 失败: %s\n%s", exc, traceback.format_exc())
+            return {
+                "questions": [],
+                "warnings": [
+                    "步骤 2（视觉 OCR）失败：视觉识别调用异常，请检查模型 Provider 配置后重试"
+                ],
+            }
+        logger.info(
+            "视觉 OCR 完成: %s 页, 耗时 %.1fs",
+            len(result.get("pages") or []),
+            time.time() - started,
+        )
+
+    questions = result.get("questions") or []
+    for index, question in enumerate(questions):
+        question["uid"] = str(index)
+    # 配图落地（裁剪图 + 整页图）：新识别与 ocr_cache 复用走同一套逻辑
+    _materialize_question_images(questions, result.get("pages") or [])
+
+    with open(os.path.join(results_dir, "agent_input.json"), "w", encoding="utf-8") as f:
+        json.dump(result.get("pages") or [], f, ensure_ascii=False, indent=2)
+    with open(questions_file, "w", encoding="utf-8") as f:
+        json.dump(questions, f, ensure_ascii=False, indent=2)
+
+    # 格式 A（tagged_text）保留到运行目录，便于人工核对题目/红笔/黑笔标注
+    tagged_text = (result.get("tagged_text") or "").strip()
+    if tagged_text:
+        with open(os.path.join(results_dir, "ocr_tagged_text.md"), "w", encoding="utf-8") as f:
+            f.write(tagged_text + "\n")
+
+    subject = (result.get("subject") or "").strip()
+    if subject:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"subject": subject}, f, ensure_ascii=False, indent=2)
+
+    if not questions:
+        return {
+            "questions": [],
+            "warnings": ["步骤 2（视觉 OCR）失败：未能从图片中识别出题目，请确认图片内容包含试题"],
+        }
+
+    console.print(f"[green][OK] 视觉识别完成: {len(questions)} 道题目[/green]")
+    return {"questions": questions, "ocr_data": result.get("pages") or []}
+
+
+def split_questions_node(state: WorkflowState) -> dict:
+    """节点: OCR + 分割题目
+
+    视觉引擎（默认）：一次视觉调用直接得到带笔迹标签的题目结构；
+    PaddleOCR 引擎（回退）：保持原有并行 OCR + 重叠批次分割流程。
+    """
+    console.print("[bold yellow]步骤 2: OCR + 分割题目[/bold yellow]")
     step_start = time.time()
+
+    if (state.get("ocr_engine") or "paddleocr") == "vision":
+        return _split_questions_vision(state)
 
     results_dir = state.get("results_dir") or settings.results_dir
     os.makedirs(results_dir, exist_ok=True)
@@ -956,6 +1148,10 @@ def correct_questions_node(state: WorkflowState) -> dict:
         if key in corrected_map:
             cq = corrected_map[key]
             corrections = cq.pop("corrections_applied", [])
+            # 纠错结果整题替换会丢掉 schema 外字段（student_answer/grading/page_index 等），
+            # 这里以纠错结果为底，原题中未出现在纠错结果里的键回填。
+            preserved = {k: v for k, v in q.items() if k not in cq}
+            cq.update(preserved)
             cq["needs_correction"] = False
             cq["ocr_issues"] = None
             cq["uid"] = q.get("uid")  # 纠错对象来自 LLM 输出，不含 uid，从原题还原

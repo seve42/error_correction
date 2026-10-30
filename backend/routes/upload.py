@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import uuid
 import logging
@@ -20,7 +20,6 @@ from core.config import settings
 from core.model_selection import LLMSelectionError, resolve_llm_selection
 from core import workflow_run_store as run_store
 from core.quota import (
-    consume_daily_free_quota,
     has_daily_free_quota,
     quota_exceeded_response,
     uses_server_llm_selection,
@@ -157,12 +156,22 @@ def _ocr_cache_path(user_id: Optional[int]) -> str:
     )
 
 
+def _vision_cache_path(user_id: Optional[int]) -> str:
+    return os.path.join(
+        str(settings.results_dir), f"ocr_cache_{_ocr_cache_key(user_id)}_vision.json"
+    )
+
+
+def _cache_path(engine: str, user_id: Optional[int]) -> str:
+    return _vision_cache_path(user_id) if engine == "vision" else _ocr_cache_path(user_id)
+
+
 def _clear_ocr_cache(user_id: Optional[int]) -> None:
-    cache_path = _ocr_cache_path(user_id)
-    try:
-        os.remove(cache_path)
-    except FileNotFoundError:
-        pass
+    for cache_path in (_ocr_cache_path(user_id), _vision_cache_path(user_id)):
+        try:
+            os.remove(cache_path)
+        except FileNotFoundError:
+            pass
 
 
 def _mark_server_ocr_cache(user_id: Optional[int], value: bool) -> None:
@@ -489,26 +498,8 @@ def run_erase():
             return jsonify({"success": False, "error": "请先上传文件"}), 400
 
         erase_sources = _expand_erase_sources(file_paths)
-        required_quota_amount = len(erase_sources)
 
-        # 额度校验
-        should_consume_quota = bool(uid)
-        if should_consume_quota:
-            with SessionLocal() as db:
-                quota_user = crud.get_user_by_id(db, uid)
-                if not quota_user:
-                    session.clear()
-                    return jsonify({"success": False, "error": "用户不存在"}), 401
-                if not has_daily_free_quota(
-                    db, quota_user, amount=required_quota_amount
-                ):
-                    payload, status = quota_exceeded_response(
-                        db,
-                        quota_user,
-                        amount=required_quota_amount,
-                    )
-                    return jsonify(payload), status
-
+        # 本地文本擦除不调用模型，不消耗免费点数。
         ensexam_configured = settings.model_path.exists()
         if not ensexam_configured:
             return jsonify({"success": False, "error": "EnsExam 模型未配置"}), 400
@@ -535,18 +526,6 @@ def run_erase():
             erased_path = settings.erased_dir / erased_name
             result_img.save(str(erased_path), format="PNG")
             erased_paths.append(str(erased_path))
-
-        # 扣减额度
-        if should_consume_quota:
-            with SessionLocal() as db:
-                quota_user = crud.get_user_by_id(db, uid)
-                if quota_user:
-                    consume_daily_free_quota(
-                        db,
-                        quota_user,
-                        amount=required_quota_amount,
-                        action_type="erase",
-                    )
 
         # 保存擦除后的路径到会话，供 /api/ocr 复用
         with session_lock:
@@ -599,10 +578,22 @@ def run_ocr():
     try:
         # 加载 OCR 凭据
         user_id = session.get("user_id")
+        request_data = request.get_json(silent=True) or {}
+        engine = str(request_data.get("engine") or "paddleocr").strip().lower()
+        if engine not in ("vision", "paddleocr"):
+            engine = "paddleocr"
         ocr_credentials = {}
+        vision_credentials = None
         _mark_server_ocr_cache(user_id, False)
         with SessionLocal() as db:
             _apply_provider_context(db, user_id)
+            if engine == "vision":
+                from pipeline.vision_ocr_client import resolve_vision_credentials
+
+                vision_credentials = resolve_vision_credentials(db, user_id)
+                if not vision_credentials:
+                    logger.warning("未配置支持图像理解的 Provider，/api/ocr 回退 PaddleOCR")
+                    engine = "paddleocr"
             if user_id:
                 ocr_provider = crud.get_active_provider(db, user_id, "paddleocr")
                 if ocr_provider:
@@ -615,11 +606,11 @@ def run_ocr():
                         "use_chart_recognition": ocr_provider.use_chart_recognition,
                     }
 
-        # 优先使用擦除后的路径
+        # 优先使用擦除后的路径（视觉引擎直接读原图，不使用擦除图）
         file_paths = None
         with session_lock:
             us = get_user_session(user_id)
-            if us["erased_file_paths"]:
+            if engine != "vision" and us["erased_file_paths"]:
                 file_paths = list(us["erased_file_paths"])
                 us["erased_file_paths"] = None  # 用完即清
 
@@ -643,6 +634,68 @@ def run_ocr():
         all_image_paths = []
         for fp in file_paths:
             all_image_paths.extend(prepare_input(fp))
+
+        # ── 视觉 OCR：deepseek-flash 直接读原图，输出带笔迹/批改标签的结构化结果 ──
+        if engine == "vision":
+            from pipeline.vision_ocr_client import VisionOCRClient
+            from core.usage import start_usage, end_usage, record_fallback_usage
+
+            vision_is_system = vision_credentials.get("source") == "system"
+            if user_id and vision_is_system:
+                with SessionLocal() as db:
+                    quota_user = crud.get_user_by_id(db, user_id)
+                    if quota_user and not has_daily_free_quota(db, quota_user, amount=1):
+                        payload, status = quota_exceeded_response(db, quota_user, amount=1)
+                        return jsonify(payload), status
+            vision_client = VisionOCRClient(
+                api_key=vision_credentials["api_key"],
+                base_url=vision_credentials.get("base_url") or "",
+                model=vision_credentials.get("model") or "deepseek-flash",
+            )
+            usage_ctx = start_usage(
+                user_id,
+                "ocr",
+                provider_source=vision_credentials.get("source") or "",
+                system_stages={"vision_ocr"} if vision_is_system else set(),
+            )
+            try:
+                result = vision_client.parse_document(
+                    all_image_paths, output_dir=str(settings.pages_dir)
+                )
+                if vision_is_system and user_id:
+                    record_fallback_usage(
+                        "openai", vision_client.model, stage="vision_ocr"
+                    )
+            finally:
+                end_usage(usage_ctx)
+            results_dir = str(settings.results_dir)
+            os.makedirs(results_dir, exist_ok=True)
+            with open(_vision_cache_path(user_id), "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            _mark_server_ocr_cache(user_id, vision_credentials.get("source") == "system")
+
+            preview_pages = []
+            for page in result.get("pages") or []:
+                image_name = os.path.basename(page.get("image_path") or "")
+                preview_pages.append(
+                    {
+                        "page_index": page.get("page_index", 0),
+                        "image_url": f"/api/image/{image_name}" if image_name else None,
+                        "page_width": page.get("width") or 1,
+                        "page_height": page.get("height") or 1,
+                        "blocks": page.get("blocks") or [],
+                    }
+                )
+            return jsonify(
+                {
+                    "success": True,
+                    "engine": "vision",
+                    "message": f"视觉识别完成，共 {len(preview_pages)} 页",
+                    "pages": preview_pages,
+                    "total_blocks": sum(len(p["blocks"]) for p in preview_pages),
+                    "tagged_text": result.get("tagged_text") or "",
+                }
+            )
 
         # 执行 OCR（获取原始结果用于预览 bbox，简化结果用于后续分割）
         from pipeline.paddleocr_client import PaddleOCRClient
@@ -691,8 +744,6 @@ def run_ocr():
         ocr_data = simplify_ocr_results(raw_ocr_results)
 
         # 保存 OCR 结果到会话，供后续 /api/split 复用
-        import json
-
         results_dir = str(settings.results_dir)
         os.makedirs(results_dir, exist_ok=True)
         ocr_cache_path = _ocr_cache_path(user_id)
@@ -804,11 +855,15 @@ def split_questions():
         model_name = data.get("model_name")  # 可选，None 时使用 provider 默认模型
         provider_source = data.get("provider_source") or None
         provider_id = data.get("provider_id") or None
+        ocr_engine = str(data.get("ocr_engine") or "paddleocr").strip().lower()
+        if ocr_engine not in ("vision", "paddleocr"):
+            ocr_engine = "paddleocr"
         # 从数据库加载用户的 LLM + OCR 凭据
         user_id = session.get("user_id")
         ocr_credentials = {}
+        vision_credentials = None
+        fallback_warning = ""
         should_consume_quota = False
-        ocr_cache_page_count = None
         with SessionLocal() as db:
             try:
                 llm_selection = resolve_llm_selection(
@@ -824,8 +879,20 @@ def split_questions():
                     jsonify({"success": False, "code": e.code, "error": e.message}),
                     e.status_code,
                 )
+            if ocr_engine == "vision":
+                from pipeline.vision_ocr_client import resolve_vision_credentials
+
+                vision_credentials = resolve_vision_credentials(db, user_id)
+                if not vision_credentials:
+                    logger.warning("未配置支持图像理解的 Provider，分割回退 PaddleOCR")
+                    ocr_engine = "paddleocr"
+                    fallback_warning = "未配置支持图像理解的模型，已回退 PaddleOCR 识别"
             if user_id:
-                uses_server_side_ocr = uses_server_ocr(db, user_id)
+                uses_server_side_ocr = uses_server_ocr(db, user_id) or (
+                    ocr_engine == "vision"
+                    and vision_credentials is not None
+                    and vision_credentials.get("source") == "system"
+                )
                 uses_server_side_llm = uses_server_llm_selection(
                     llm_selection["source"],
                     db=db,
@@ -838,17 +905,8 @@ def split_questions():
                     if not quota_user:
                         session.clear()
                         return jsonify({"success": False, "error": "用户不存在"}), 401
-                    cache_path = _ocr_cache_path(user_id)
-                    if os.path.exists(cache_path):
-                        try:
-                            with open(cache_path, "r", encoding="utf-8") as f:
-                                cached_ocr_data = json.load(f)
-                            if isinstance(cached_ocr_data, list) and cached_ocr_data:
-                                ocr_cache_page_count = len(cached_ocr_data)
-                        except Exception:
-                            logger.warning("读取 OCR 缓存页数失败，将在分割完成后按实际页数校验", exc_info=True)
-                    if ocr_cache_page_count:
-                        required_quota_amount = ocr_cache_page_count
+                    # 点数按模型实际费用在调用结束后结算，这里只做最低 1 点的预检。
+                    required_quota_amount = 1
                     if not has_daily_free_quota(db, quota_user, amount=required_quota_amount):
                         payload, status = quota_exceeded_response(
                             db,
@@ -908,20 +966,58 @@ def split_questions():
             "file_paths": file_paths,
             "model_provider": model_provider,
             "model_name": llm_selection["model_name"],
+            "ocr_engine": ocr_engine,
             "ocr_credentials": ocr_credentials,
-            "ocr_cache_path": _ocr_cache_path(user_id),
+            "vision_credentials": vision_credentials or {},
+            "ocr_cache_path": _cache_path(ocr_engine, user_id),
             "results_dir": result_dir,
         }
-        workflow_graph.invoke(initial_state, config=config)
-        result_state = workflow_graph.invoke(None, config=config)
+        from core.usage import start_usage, end_usage, record_fallback_usage
+
+        # 视觉引擎在 /api/ocr 已消费缓存时不会再次调用视觉模型，避免重复计费
+        has_vision_cache = bool(
+            ocr_engine == "vision"
+            and user_id
+            and os.path.exists(_cache_path("vision", user_id))
+        )
+        system_stages = set()
+        if should_consume_quota and uses_server_side_llm and ocr_engine != "vision":
+            system_stages.add("llm")
+        if (
+            ocr_engine == "vision"
+            and vision_credentials
+            and vision_credentials.get("source") == "system"
+            and not has_vision_cache
+        ):
+            system_stages.add("vision_ocr")
+        usage_ctx = start_usage(
+            user_id,
+            "split",
+            run_id=run_id,
+            provider_source=llm_selection["source"] if uses_server_side_llm else "",
+            system_stages=system_stages,
+        )
+        try:
+            workflow_graph.invoke(initial_state, config=config)
+            result_state = workflow_graph.invoke(None, config=config)
+            if "llm" in system_stages and user_id:
+                record_fallback_usage(
+                    model_provider, llm_selection["model_name"], stage="llm"
+                )
+            if "vision_ocr" in system_stages and user_id:
+                record_fallback_usage(
+                    "openai",
+                    (vision_credentials or {}).get("model") or "vision",
+                    stage="vision_ocr",
+                )
+        finally:
+            end_usage(usage_ctx)
         _mark_server_ocr_cache(user_id, False)
 
         questions = result_state.get("questions", [])
-        warnings = result_state.get("warnings", [])
-        if should_consume_quota:
-            actual_ocr_data = result_state.get("ocr_data") or []
-            if actual_ocr_data:
-                required_quota_amount = len(actual_ocr_data)
+        warnings = list(result_state.get("warnings", []) or [])
+        if fallback_warning:
+            warnings.insert(0, fallback_warning)
 
         if not questions:
             failure_message = (
@@ -984,22 +1080,10 @@ def split_questions():
         except Exception:
             logger.warning("保存分割记录失败，不影响主流程", exc_info=True)
 
-        if should_consume_quota and user_id:
-            with SessionLocal() as db:
-                quota_user = crud.get_user_by_id(db, user_id)
-                if quota_user:
-                    if not has_daily_free_quota(db, quota_user, amount=required_quota_amount):
-                        payload, status = quota_exceeded_response(
-                            db,
-                            quota_user,
-                            amount=required_quota_amount,
-                        )
-                        return jsonify(payload), status
-                    consume_daily_free_quota(db, quota_user, amount=required_quota_amount, action_type="split")
-
         return jsonify(
             {
                 "success": True,
+                "engine": ocr_engine,
                 "message": f"成功分割 {len(questions)} 道题目",
                 "run_id": run_id,
                 "questions": questions,
@@ -1134,3 +1218,26 @@ def serve_image(filename):
         if os.path.exists(path):
             return send_from_directory(str(d), filename)
     return jsonify({"error": "File not found"}), 404
+
+
+@bp.route("/question-image/<path:filename>")
+def serve_question_image(filename):
+    """提供题目配图（图形裁剪 / 整页原图）访问。
+
+    send_from_directory 已拒绝 .. 越界；这里再显式拒绝绝对路径与盘符。
+    """
+    from flask import send_from_directory
+
+    candidate = filename or ""
+    if (
+        not candidate
+        or os.path.splitdrive(candidate)[0]
+        or os.path.isabs(candidate)
+        or candidate.startswith(("/", "\\"))
+        or any(part == ".." for part in candidate.replace("\\", "/").split("/"))
+    ):
+        return jsonify({"error": "File not found"}), 404
+
+    root = str(settings.question_images_dir)
+    os.makedirs(root, exist_ok=True)
+    return send_from_directory(root, candidate)

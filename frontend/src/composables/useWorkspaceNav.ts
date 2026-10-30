@@ -61,7 +61,7 @@ const VIEW_TO_PATH: Record<WorkspaceView, string> = {
 const WORKSPACE_VIEWS = new Set<WorkspaceView>(['workspace', 'workspace_review', 'split-history'])
 
 const SETTINGS_NAV_ITEMS: NavGroupItem[] = [
-  { id: 'quota', label: '免费额度', icon: 'fa-gauge-high' },
+  { id: 'quota', label: '免费点数', icon: 'fa-gauge-high' },
   { id: 'system-providers', label: '平台托管 API', icon: 'fa-server', adminOnly: true },
   { id: 'appearance', label: '外观设置', icon: 'fa-palette' },
   { id: 'profile', label: '用户资料设置', icon: 'fa-user-gear' },
@@ -73,7 +73,6 @@ const NAV_GROUPS: NavGroup[] = [
     label: null,
     items: [
       { id: 'workspace', label: '录入工作台', icon: 'fa-wand-magic-sparkles', match: (v) => WORKSPACE_VIEWS.has(v) },
-      { id: 'dashboard', label: '数据面板', icon: 'fa-chart-pie', match: (v) => v === 'dashboard' },
       { id: 'search-chat', label: '搜索聊天', icon: 'fa-magnifying-glass', match: (v) => v === 'search-chat' },
       { id: 'library', label: '资料库', icon: 'fa-box-archive', match: (v) => v === 'library' },
     ],

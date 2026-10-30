@@ -1,14 +1,54 @@
 import { assertJsonSuccess, buildModelBody, createNetworkError, handleXhrJsonResult } from './client'
 import type { ApiRequestBody, ApiResponseLike } from './client'
+import type { QuestionGrading } from '@/types/domain'
 
 type Id = string | number
 type UploadFilesResponse = Exclude<ApiResponseLike, null>
-type EraseResponse = { success: true; images?: string[]; message?: string }
-type OcrResponse = { success: true; pages?: unknown[]; message?: string }
+
+/** 视觉 OCR 引擎：前端固定传 vision，实际使用哪个视觉模型由后端配置决定。 */
+export type OcrEngine = 'vision'
+
+/** 视觉 OCR 的单个内容块；bbox 通常为 null，前端不依赖坐标。 */
+export type OcrBlock = {
+  label: string
+  content: string
+  bbox: number[] | null
+  pen?: 'printed' | 'red' | 'black'
+  [key: string]: unknown
+}
+
+/** 视觉 OCR 的单页结果。 */
+export type OcrPage = {
+  page_index: number
+  image_url: string | null
+  page_width: number
+  page_height: number
+  blocks: OcrBlock[]
+  [key: string]: unknown
+}
+
+export type OcrResponse = {
+  success: true
+  message?: string
+  engine?: string
+  pages?: OcrPage[]
+}
+
+/** 分割接口返回的题目，新字段均为可选，旧数据可能不包含。 */
+export type SplitQuestion = {
+  uid?: Id
+  page_index?: number
+  student_answer?: string
+  has_handwriting?: boolean
+  grading?: QuestionGrading
+  red_marks?: Array<{ type?: string; text?: string; linked_qid?: string }>
+  [key: string]: unknown
+}
+
 type SplitResponse = {
   success: true
   run_id?: Id | null
-  questions?: Array<Record<string, unknown>>
+  questions?: SplitQuestion[]
   warnings?: string[]
   message?: string
 }
@@ -61,21 +101,33 @@ export function uploadFiles(formData: FormData, { onProgress, onSuccess, onError
   return xhr
 }
 
-export async function runErase() {
-  const resp = await fetch('/api/erase', { method: 'POST' })
-  return assertJsonSuccess<EraseResponse>(resp, '擦除失败')
+/**
+ * 调用视觉 OCR 接口，识别上传页面上的印刷题、手写作答与红笔批改。
+ * 后端不再返回可靠 bbox，预览以页面图和识别文本列表为主。
+ */
+export async function runOcr(engine: OcrEngine = 'vision') {
+  const resp = await fetch('/api/ocr', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ engine }),
+  })
+  return assertJsonSuccess<OcrResponse>(resp, '视觉识别失败')
 }
 
-export async function runOcr() {
-  const resp = await fetch('/api/ocr', { method: 'POST' })
-  return assertJsonSuccess<OcrResponse>(resp, 'OCR 执行失败')
-}
-
-export async function splitQuestions(modelProvider: string, modelName?: string, providerSource?: string, providerId?: Id | null) {
+/**
+ * 调用题目分割接口；固定携带 ocr_engine，与后端的视觉 OCR 结果对齐。
+ */
+export async function splitQuestions(
+  modelProvider: string,
+  modelName?: string,
+  providerSource?: string,
+  providerId?: Id | null,
+  ocrEngine: OcrEngine = 'vision',
+) {
   const resp = await fetch('/api/split', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(buildModelBody(modelProvider, modelName, providerSource, providerId)),
+    body: JSON.stringify(buildModelBody(modelProvider, modelName, providerSource, providerId, { ocr_engine: ocrEngine })),
   })
   return assertJsonSuccess<SplitResponse>(resp, '题目分割失败')
 }

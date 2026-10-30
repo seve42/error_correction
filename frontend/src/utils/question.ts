@@ -34,6 +34,30 @@ export const getQuestionSnippet = (q, maxLen = 0, fallback = '') => {
   return safeTruncate(raw, maxLen)
 }
 
+/**
+ * 收敛生成标准答案接口所需的单题字段，答题页与工作台共用。
+ * blocks/options 允许调用方传入已规范化的数组（如详情面板的 contentBlocks）。
+ */
+export const buildGeneratedAnswerQuestion = (question, blocks = null, options = null) => {
+  if (!question) return null
+  return {
+    uid: question.uid ?? null,
+    id: question.id ?? null,
+    question_id: question.question_id ?? question.id ?? null,
+    question_type: question.question_type || '',
+    content_blocks: blocks ?? question.content_json ?? question.content_blocks ?? [],
+    options: options ?? question.options_json ?? question.options ?? [],
+  }
+}
+
+/** 把标准答案与解析合成可展示、可入库的文本（解析以 Markdown 加粗小标题接在后面）。 */
+export const composeAnswerWithReasoning = (answer, reasoning) => {
+  const head = String(answer || '').trim()
+  const body = String(reasoning || '').trim()
+  if (!body) return head
+  return head ? `${head}\n\n**解析**\n\n${body}` : `**解析**\n\n${body}`
+}
+
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 
 const daysSince = (iso) => {

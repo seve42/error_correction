@@ -107,14 +107,15 @@ watch(systemStatus, (newVal) => {
 
 const statusPills = computed(() => {
   if (statusLoading.value) return [
-    { key: 'paddle', loading: true, label: 'PaddleOCR' },
+    { key: 'vision', loading: true, label: '视觉识别' },
     { key: 'ensexam', loading: true, label: 'EnsExam' },
     { key: 'langsmith', loading: true, label: 'LangSmith' },
   ]
   const s = systemStatus.value
   if (!s) return []
   const pills = []
-  pills.push({ key: 'paddle', ok: !!s.paddleocr_configured, label: s.paddleocr_configured ? 'PaddleOCR' : 'PaddleOCR未配置' })
+  // 视觉识别状态以是否已配置模型为准，不绑定具体模型品牌。
+  pills.push({ key: 'vision', ok: hasConfiguredModel.value, label: hasConfiguredModel.value ? '视觉识别' : '视觉识别未配置' })
   if (s.ensexam_configured) {
     pills.push({ key: 'ensexam', ok: true, label: 'EnsExam' })
   }

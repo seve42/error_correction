@@ -64,7 +64,8 @@ def client(test_db):
          patch("routes.chat.SessionLocal", fake), \
          patch("routes.questions.SessionLocal", fake), \
          patch("routes.settings.SessionLocal", fake), \
-         patch("routes.auth.SessionLocal", fake):
+         patch("routes.auth.SessionLocal", fake), \
+         patch("db.SessionLocal", fake):
         from web_app import app
         app.config["TESTING"] = True
         with app.test_client() as c:
@@ -295,9 +296,10 @@ class TestStreamChat:
         )
         assert resp.status_code == 404
 
-    def test_server_managed_chat_consumes_quota_after_success(self, client, test_db):
+    def test_server_managed_chat_consumes_quota_after_success(self, client, test_db, monkeypatch):
+        monkeypatch.setattr("core.config.settings.daily_free_quota", 100)
         user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
-        user.daily_free_quota = 5
+        user.daily_free_quota = 100
         user.daily_free_used = 0
         user.daily_free_quota_date = datetime.utcnow().date().isoformat()
         test_db.commit()
@@ -481,8 +483,10 @@ class TestStreamChat:
         assert data["code"] == "MODEL_OPTION_NOT_FOUND"
         assert "个人模型不可用" in data["error"]
 
-    def test_quota_exhausted_chat_returns_429_and_does_not_save_user_message(self, client, test_db):
+    def test_quota_exhausted_chat_returns_429_and_does_not_save_user_message(self, client, test_db, monkeypatch):
         user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
+        # 测试固定使用默认 100 次额度，避免受部署环境 APP_DAILY_FREE_QUOTA 影响
+        monkeypatch.setattr("core.config.settings.daily_free_quota", 100)
         user.daily_free_quota = 100
         user.daily_free_used = 100
         user.daily_free_quota_date = datetime.utcnow().date().isoformat()

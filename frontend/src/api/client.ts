@@ -1,10 +1,54 @@
 /**
  * API shared client helpers.
  */
+
+/** 一次用量的 token / 费用 / 点数统计，字段均为可选以兼容旧版后端。 */
+export type UsageTotals = {
+  requests?: number
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  cached_tokens?: number
+  cost_yuan?: number
+  points?: number
+}
+
+/** 单个模型的用量统计。 */
+export type UsageByModel = {
+  model_name: string
+  requests?: number
+  total_tokens?: number
+  cost_yuan?: number
+  points?: number
+}
+
+/** `GET /api/auth/me` 返回的额度快照；后端字段仍在演进，未列出的字段透传。 */
+export type QuotaSnapshot = {
+  daily_free_quota?: number
+  daily_free_used?: number
+  remaining?: number
+  quota_date?: string
+  reset_at?: string
+  /** 额度单位，新后端固定为“点”。 */
+  unit?: string
+  today_usage?: UsageTotals
+  today_by_model?: UsageByModel[]
+  usage_stats?: {
+    breakdown?: unknown[]
+    recent_events?: unknown[]
+    daily_chart?: {
+      days?: unknown[]
+      range_days?: number
+      actions?: { key: string; label: string }[]
+    }
+  }
+  [key: string]: unknown
+}
+
 export type ApiError = Error & {
   status: number | null
   code: string | null
-  quota: unknown
+  quota: QuotaSnapshot | null
 }
 
 export type ApiRequestBody = Record<string, unknown>
@@ -12,7 +56,7 @@ export type ApiRequestBody = Record<string, unknown>
 type ApiErrorDetail = {
   status?: number | null
   code?: string | null
-  quota?: unknown
+  quota?: QuotaSnapshot | null
 }
 
 export type ApiResponseLike = ({
@@ -20,7 +64,7 @@ export type ApiResponseLike = ({
   error?: string
   message?: string
   code?: string | null
-  quota?: unknown
+  quota?: QuotaSnapshot | null
 } & Record<string, unknown>) | null
 
 type XhrSuccessHandler<TData> = (data: TData) => void

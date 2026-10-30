@@ -137,15 +137,19 @@ class OpenAICompatibleConfig(LLMProviderConfig):
         from langchain_openai import ChatOpenAI
         import httpx
         from core.config import settings
+        from core.usage import UsageCallbackHandler
         timeout = httpx.Timeout(120.0, connect=10.0)
         http_client = httpx.Client(trust_env=settings.trust_env, timeout=timeout)
         kwargs = dict(
-            model=model, 
-            api_key=self.api_key, 
+            model=model,
+            api_key=self.api_key,
             temperature=temperature,
             http_client=http_client,
             timeout=(10.0, 120.0),
             max_retries=0,
+            callbacks=[UsageCallbackHandler("openai", model)],
+            # 自定义 base_url + http_client 时 stream_usage 默认 False，显式开启才能拿到流式用量。
+            stream_usage=True,
         )
         if self.base_url:
             kwargs["base_url"] = self.base_url
@@ -168,6 +172,7 @@ class AnthropicCompatibleConfig(LLMProviderConfig):
         from langchain_anthropic import ChatAnthropic
         import httpx
         from core.config import settings
+        from core.usage import UsageCallbackHandler
         timeout = httpx.Timeout(120.0, connect=10.0)
         http_client = httpx.Client(trust_env=settings.trust_env, timeout=timeout)
         return ChatAnthropic(
@@ -176,6 +181,8 @@ class AnthropicCompatibleConfig(LLMProviderConfig):
             http_client=http_client,
             timeout=120.0,
             max_retries=0,
+            callbacks=[UsageCallbackHandler("anthropic", model)],
+            stream_usage=True,
         )
 
 
@@ -208,6 +215,8 @@ class Settings(BaseSettings):
     results_dir: Path | None = None
     erased_dir: Path | None = None
     runs_dir: Path | None = None
+    # 题目配图（图形裁剪 + 整页原图）持久目录，split 与入库后都必须可访问
+    question_images_dir: Path | None = None
 
     # 文字擦除模型权重路径，可通过 APP_MODEL_PATH 覆盖
     model_path: Path | None = None
@@ -216,6 +225,9 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 50
     allowed_extensions: set[str] = {"pdf", "png", "jpg", "jpeg", "bmp", "tiff", "webp"}
     daily_free_quota: int = 100
+    # 模型价目表（JSON）：元/百万 token，可覆盖内置默认价与峰时倍率。
+    # 例：{"deepseek-flash":{"miss":1.0,"hit":0.1,"out":4.0,"peak_multiplier":2.0}}
+    model_prices: str = ""
     trust_env: bool = (
         True  # 是否信任系统代理环境变量，Windows 下设为 False 可解 WinError 10054
     )
@@ -270,6 +282,8 @@ class Settings(BaseSettings):
             self.erased_dir = self.runtime_dir / "erased"
         if self.runs_dir is None:
             self.runs_dir = self.runtime_dir / "runs"
+        if self.question_images_dir is None:
+            self.question_images_dir = self.runtime_dir / "question_images"
         if self.model_path is None:
             self.model_path = _BACKEND_ROOT / "text_eraser_model" / "weight" / "best.pth"
 
@@ -295,6 +309,7 @@ class Settings(BaseSettings):
             self.results_dir,
             self.erased_dir,
             self.runs_dir,
+            self.question_images_dir,
         ]:
             d.mkdir(parents=True, exist_ok=True)
 

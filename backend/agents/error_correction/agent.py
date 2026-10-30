@@ -512,3 +512,26 @@ def invoke_correction(prompt: str, provider: str = "openai", model_name: str | N
         system_prompt_fallback=CORRECTION_PROMPT,
         cache_key="correction", agent_factory=create_correction_agent,
     )
+
+
+def invoke_structured_output(
+    *,
+    schema,
+    prompt: str,
+    system_prompt: str,
+    provider: str = "openai",
+    model_name: str | None = None,
+    temperature: float = 0.0,
+    cache_key: str = "generic",
+):
+    """通用结构化输出调用，供其他 Agent 复用同一套多模式回退。"""
+    return _invoke_structured(
+        prompt=prompt,
+        provider=provider,
+        model_name=model_name,
+        temperature=temperature,
+        schema=schema,
+        system_prompt_fallback=system_prompt,
+        cache_key=cache_key,
+        agent_factory=None,
+    )

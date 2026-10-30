@@ -16,7 +16,6 @@ import { useErrorBankStats } from '@/composables/useErrorBankStats'
 import ContentPanel from '@/components/features/app/layout/ContentPanel.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseStat from '@/components/base/BaseStat.vue'
-import ErrorLearningAside from '@/components/features/app/error-bank/ErrorLearningAside.vue'
 import ErrorQuestionFinderAside from '@/components/features/app/error-bank/ErrorQuestionFinderAside.vue'
 import ErrorQuestionDetailPanel from '@/components/features/app/error-bank/ErrorQuestionDetailPanel.vue'
 import ErrorQuestionListPanel from '@/components/features/app/error-bank/ErrorQuestionListPanel.vue'
@@ -41,14 +40,13 @@ const { openChat } = useChatSession()
 const { activeQuestionProjectId, questionProjects } = useProjects()
 const hasQuestionProject = computed(() => questionProjects.value.length > 0)
 
-const activeTab = ref('analysis')
+const activeTab = ref('answer')
 const workbenchView = ref('list')
 const statsCollapsed = ref(false)
 
 const { selectMode, selectedIds, toggleSelectMode, toggleSelect, clearSelection } = useSelectableList()
 
 const detailTabs = [
-  { value: 'analysis', label: 'AI 解析', icon: 'fa-wand-magic-sparkles' },
   { value: 'answer', label: '答案解析', icon: 'fa-circle-check' },
   { value: 'note', label: '作答记录', icon: 'fa-camera' },
 ] as const
@@ -95,17 +93,13 @@ const {
   dialogSaving,
   detailOpen,
   detailQuestion,
-  aiLoading,
-  aiSummary,
   openDetail,
   openEditDialog,
   onDialogSave,
   quickMarkStatus,
   doDelete,
   doExport,
-  requestAnalysis,
   startPractice,
-  clearAiAnalysis,
 } = useErrorBankActions({
   items,
   total,
@@ -119,30 +113,13 @@ const {
   loadStats,
 })
 
-const errorPatternRows = computed(() => {
-  const tags = knowledgeTags.value.slice(0, 4)
-  if (!tags.length) {
-    return [
-      { label: '鍩虹姒傚康涓嶇ǔ', percent: 48, color: 'bg-orange-400' },
-      { label: '璁＄畻杩囩▼澶辫', percent: 32, color: 'bg-blue-400' },
-      { label: '瀹￠淇℃伅閬楁紡', percent: 20, color: 'bg-emerald-400' },
-    ]
-  }
-  return tags.map((tag, idx) => ({
-    label: tag,
-    percent: Math.max(12, 48 - idx * 10),
-    color: ['bg-orange-400', 'bg-blue-400', 'bg-emerald-400', 'bg-violet-400'][idx] || 'bg-slate-400',
-  }))
-})
-
 /**
  * 閫夋嫨棰樼洰鍚庡悓姝ヨ鎯呭拰鍒嗘瀽鍖哄煙銆?
  */
 const selectQuestion = async (q: ErrorBankQuestion | null | undefined) => {
   if (!q) return
   activeQuestionId.value = q.id
-  activeTab.value = 'analysis'
-  clearAiAnalysis()
+  activeTab.value = 'answer'
   await nextTick()
   await typesetMath()
 }
@@ -219,7 +196,8 @@ defineExpose({
       </div>
 
       <!-- 涓讳綋锛氬垪琛?璇︽儏涓讳粠鍒囨崲 + 鍙充晶瀛︿範鍒嗘瀽 -->
-      <div class="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,0.34fr)]">
+      <div class="grid min-h-0 flex-1 gap-4"
+        :class="workbenchView === 'list' ? 'xl:grid-cols-[minmax(0,1fr)_minmax(16rem,0.34fr)]' : ''">
         <div class="flex min-h-0 flex-col gap-3">
           <ErrorQuestionListPanel
             v-if="workbenchView === 'list'"
@@ -257,7 +235,6 @@ defineExpose({
             :option-list="optionList"
             :knowledge-tags="knowledgeTags"
             :detail-tabs="detailTabs"
-            :ai-summary="aiSummary"
             @edit="openEditDialog"
             @delete="doDelete"
             @open-image="openModal"
@@ -265,6 +242,7 @@ defineExpose({
             @open-chat="openChat"
             @start-practice="startPractice"
             @back-to-list="workbenchView = 'list'"
+            @answer-saved="doQuery"
           />
         </div>
 
@@ -274,14 +252,6 @@ defineExpose({
           :project-id="activeQuestionProjectId"
           @select-question="handleFinderSelect"
           @error="(e) => pushToast('error', e instanceof Error ? e.message : 'AI 鎵鹃澶辫触')"
-        />
-        <ErrorLearningAside
-          v-else
-          :knowledge-tags="knowledgeTags"
-          :error-pattern-rows="errorPatternRows"
-          :ai-summary="aiSummary"
-          :ai-loading="aiLoading"
-          @request-analysis="requestAnalysis"
         />
       </div>
 

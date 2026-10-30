@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
  * ErrorQuestionDetailPanel.vue
- * 错题库中间题目详情面板。
+ * 错题库中间题目详情面板：题干、选项、答案解析与作答记录，并支持 AI 生成标准答案解析。
  */
+import { computed, ref } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseEmptyState from '@/components/base/BaseEmptyState.vue'
 import BasePanel from '@/components/base/BasePanel.vue'
@@ -11,16 +12,19 @@ import BasePopconfirm from '@/components/base/BasePopconfirm.vue'
 import BaseTabs from '@/components/base/BaseTabs.vue'
 import BaseTag from '@/components/base/BaseTag.vue'
 import BaseToolbarButton from '@/components/base/BaseToolbarButton.vue'
-import { formatOption, isHtml, sanitizeHtml } from '@/utils/index'
+import RichContent from '@/components/features/app/shared/RichContent.vue'
+import { buildGeneratedAnswerQuestion, composeAnswerWithReasoning, formatOption } from '@/utils/index'
+import * as api from '@/api/index'
+import { useSystemStatus } from '@/composables/useSystemStatus'
+import { useToast } from '@/composables/useToast'
 
 const props = defineProps({
   question: { type: Object, default: null },
   contentBlocks: { type: Array, default: () => [] },
   optionList: { type: Array, default: () => [] },
   knowledgeTags: { type: Array, default: () => [] },
-  activeTab: { type: String, default: 'analysis' },
+  activeTab: { type: String, default: 'answer' },
   detailTabs: { type: Array, default: () => [] },
-  aiSummary: { type: String, default: '' },
 })
 
 const emit = defineEmits([
@@ -32,7 +36,15 @@ const emit = defineEmits([
   'open-chat',
   'start-practice',
   'back-to-list',
+  'answer-saved',
 ])
+
+const { selectedLlmOption } = useSystemStatus()
+const { pushToast } = useToast()
+const generatingAnswer = ref(false)
+const hasAnswer = computed(() => Boolean(String(props.question?.answer || '').trim()))
+const modelReady = computed(() => Boolean(selectedLlmOption.value?.category && selectedLlmOption.value?.model_name))
+const generateHint = computed(() => (modelReady.value ? '' : '请先在设置中选择模型'))
 
 const statusTone = (status) => {
   if (status === '已掌握') return 'emerald'
@@ -41,6 +53,38 @@ const statusTone = (status) => {
 }
 
 const setActiveTab = (value) => emit('update:activeTab', value)
+
+/** 用当前选中模型生成标准答案与解析，并保存到题目上。 */
+const generateAnswer = async () => {
+  if (!props.question || generatingAnswer.value) return
+  const option = selectedLlmOption.value
+  if (!option?.category || !option?.model_name) {
+    pushToast('error', '请先在顶部选择一个可用模型')
+    return
+  }
+  generatingAnswer.value = true
+  try {
+    const payload = buildGeneratedAnswerQuestion(props.question, props.contentBlocks, props.optionList)
+    const results = await api.generateAnswers([payload], {
+      modelProvider: option.category,
+      modelName: option.model_name,
+      providerSource: option.source,
+      providerId: option.provider_id,
+    })
+    const result = results[0]
+    if (!result) throw new Error('后端未返回生成结果')
+    const text = composeAnswerWithReasoning(result.answer, result.reasoning)
+    if (!text) throw new Error('生成结果为空')
+    const data = await api.saveQuestionAnswer(props.question.id, text)
+    props.question.answer = text
+    emit('answer-saved', props.question.id, text, data?.updated_at)
+    pushToast('success', '已生成标准答案解析')
+  } catch (e) {
+    pushToast('error', e instanceof Error ? e.message : '生成标准答案解析失败')
+  } finally {
+    generatingAnswer.value = false
+  }
+}
 </script>
 
 <template>
@@ -69,17 +113,11 @@ const setActiveTab = (value) => emit('update:activeTab', value)
 
           <div class="rounded-xl bg-gray-50/85 p-5 dark:bg-white/[0.035]">
             <template v-for="(block, index) in contentBlocks" :key="index">
-              <div
-                v-if="block.block_type === 'text' && isHtml(block.content)"
-                v-html="sanitizeHtml(block.content)"
-                class="question-rich mb-4 text-[15px] font-medium leading-8 text-gray-800 dark:text-[#d0d6e0]"
-              ></div>
-              <p
-                v-else-if="block.block_type === 'text'"
+              <RichContent
+                v-if="block.block_type === 'text'"
                 class="mb-4 text-[15px] font-medium leading-8 text-gray-800 dark:text-[#d0d6e0]"
-              >
-                {{ block.content }}
-              </p>
+                :content="block.content"
+              />
               <img
                 v-else-if="block.block_type === 'image'"
                 :src="block.content"
@@ -96,42 +134,36 @@ const setActiveTab = (value) => emit('update:activeTab', value)
               class="rounded-xl bg-gray-50/80 px-4 py-3 text-sm font-medium text-gray-700 dark:bg-white/[0.035] dark:text-[#d0d6e0]"
             >
               <span class="mr-2 text-gray-400">{{ String.fromCharCode(65 + index) }}.</span>
-              {{ formatOption(option).replace(/^[A-Da-d][.、．]\s*/, '') }}
+              <RichContent inline :content="formatOption(option).replace(/^[A-Da-d][.、．]\s*/, '')" />
             </div>
+          </div>
+
+          <!-- 整页原图：视觉 OCR 时保留原始页面，便于核对裁剪区域 -->
+          <div v-if="question.page_image" class="space-y-2">
+            <div class="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-gray-400 dark:text-[#8a8f98]">
+              <i class="fa-regular fa-image"></i>
+              <span>整页原图</span>
+            </div>
+            <img
+              :src="question.page_image"
+              class="max-h-56 max-w-full cursor-zoom-in rounded-xl border border-gray-200 object-contain shadow-sm shadow-black/[0.04] dark:border-white/10 dark:shadow-black/20"
+              @click="emit('open-image', question.page_image)"
+            />
           </div>
 
           <div class="rounded-xl bg-white/75 shadow-sm shadow-black/[0.03] dark:bg-white/[0.035] dark:shadow-black/20">
             <BaseTabs :model-value="activeTab" :items="detailTabs" @update:model-value="setActiveTab" />
 
             <div class="p-5">
-              <div v-if="activeTab === 'analysis'" class="space-y-4">
-                <div class="rounded-xl bg-gray-50/80 p-4 dark:bg-white/[0.035]">
-                  <h4 class="mb-2 text-sm font-bold accent-text">
-                    <i class="fa-solid fa-wand-magic-sparkles mr-1.5"></i>总结
-                  </h4>
-                  <p class="text-sm leading-7 text-gray-600 dark:text-[#b8bec8]">{{ aiSummary }}</p>
-                </div>
-                <div class="rounded-xl bg-gray-50/80 p-4 dark:bg-white/[0.035]">
-                  <h4 class="mb-3 text-sm font-bold text-gray-900 dark:text-[#f7f8f8]">建议步骤</h4>
-                  <ol class="space-y-2 text-sm leading-7 text-gray-600 dark:text-[#b8bec8]">
-                    <li>1. 先复盘题干中的关键条件和对应知识点；</li>
-                    <li>2. 对照答案解析，标记自己卡住的步骤；</li>
-                    <li>3. 将题目状态改为复习中，并在掌握后标记为已掌握。</li>
-                  </ol>
-                </div>
-              </div>
-
-              <div v-else-if="activeTab === 'answer'" class="space-y-3">
-                <p v-if="question.answer" class="whitespace-pre-wrap text-sm leading-7 text-gray-700 dark:text-[#d0d6e0]">
-                  {{ question.answer }}
-                </p>
-                <BaseEmptyState v-else icon="fa-regular fa-circle-question" title="暂无答案解析" description="可以点击编辑，为这道题补充标准答案或解析。" />
+              <div v-if="activeTab === 'answer'" class="space-y-3">
+                <RichContent v-if="question.answer" class="text-sm leading-7 text-gray-700 dark:text-[#d0d6e0]"
+                  :content="question.answer" />
+                <BaseEmptyState v-else icon="fa-regular fa-circle-question" title="暂无答案解析" description="可以点击编辑补充标准答案，或用 AI 生成答案解析。" />
               </div>
 
               <div v-else class="space-y-3">
-                <p v-if="question.user_answer" class="whitespace-pre-wrap text-sm leading-7 text-gray-700 dark:text-[#d0d6e0]">
-                  {{ question.user_answer }}
-                </p>
+                <RichContent v-if="question.user_answer" class="text-sm leading-7 text-gray-700 dark:text-[#d0d6e0]"
+                  :content="question.user_answer" />
                 <BaseEmptyState v-else icon="fa-solid fa-camera" title="还没有作答记录" description="拍照、上传或手动记录你的答案和解题过程。" />
               </div>
             </div>
@@ -144,6 +176,24 @@ const setActiveTab = (value) => emit('update:activeTab', value)
           <i class="fa-solid fa-magnifying-glass-chart"></i>
           查看完整解析
         </BaseButton>
+        <BasePopconfirm
+          v-if="hasAnswer"
+          title="重新生成标准答案解析？"
+          description="将用 AI 生成的内容覆盖当前保存的答案与解析。"
+          confirm-text="重新生成"
+          @confirm="generateAnswer"
+        >
+          <BaseButton size="sm" variant="secondary" :disabled="generatingAnswer || !modelReady" :title="generateHint">
+            <i class="fa-solid" :class="generatingAnswer ? 'fa-circle-notch fa-spin' : 'fa-wand-magic-sparkles'"></i>
+            {{ generatingAnswer ? '生成中…' : 'AI 重新生成解析' }}
+          </BaseButton>
+        </BasePopconfirm>
+        <BaseButton v-else size="sm" variant="secondary" :disabled="generatingAnswer || !modelReady" :title="generateHint"
+          @click="generateAnswer">
+          <i class="fa-solid" :class="generatingAnswer ? 'fa-circle-notch fa-spin' : 'fa-wand-magic-sparkles'"></i>
+          {{ generatingAnswer ? '生成中…' : 'AI 生成标准答案解析' }}
+        </BaseButton>
+        <span v-if="!modelReady" class="text-xs text-amber-600 dark:text-amber-400">请先在设置中选择模型</span>
         <BaseButton size="sm" variant="secondary" @click="emit('open-chat', question)">
           <i class="fa-solid fa-comments"></i>
           AI 讲解
@@ -151,10 +201,6 @@ const setActiveTab = (value) => emit('update:activeTab', value)
         <BaseButton size="sm" variant="secondary" @click="emit('start-practice')">
           <i class="fa-solid fa-calendar-plus"></i>
           加入复习
-        </BaseButton>
-        <BaseButton size="sm" variant="secondary" disabled title="需要后端同类题生成接口">
-          <i class="fa-solid fa-shuffle"></i>
-          同类题
         </BaseButton>
       </div>
     </template>
@@ -164,25 +210,3 @@ const setActiveTab = (value) => emit('update:activeTab', value)
     <BaseEmptyState icon="fa-solid fa-file-circle-question" title="请选择一道题目" description="从左侧列表选择题目后，这里会展示题干、选项和解析。" />
   </BasePanel>
 </template>
-
-<style scoped>
-.question-rich :deep(table) {
-  @apply my-4 block w-full overflow-x-auto rounded-xl border border-gray-200 text-sm dark:border-white/[0.08];
-}
-
-.question-rich :deep(th) {
-  @apply bg-gray-100 px-3 py-2 text-left font-bold dark:bg-white/[0.06];
-}
-
-.question-rich :deep(td) {
-  @apply border-t border-gray-200 px-3 py-2 dark:border-white/[0.08];
-}
-
-.question-rich :deep(ul) {
-  @apply my-2 list-disc pl-5;
-}
-
-.question-rich :deep(ol) {
-  @apply my-2 list-decimal pl-5;
-}
-</style>

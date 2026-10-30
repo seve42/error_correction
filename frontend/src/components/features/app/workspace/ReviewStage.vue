@@ -1,11 +1,10 @@
 <script setup lang="ts">
 /**
  * ReviewStage.vue
- * 工作台第二页：分割结果核对（擦除预览 / OCR 预览 / 分割中 / 题目列表）
+ * 工作台第二页：识别结果核对（OCR 预览 / 分割中 / 题目列表）
  */
 import { nextTick, ref, watch } from 'vue'
 import BaseTag from '@/components/base/BaseTag.vue'
-import ErasePreview from '@/components/features/app/workspace/ErasePreview.vue'
 import OcrPreview from '@/components/features/app/workspace/OcrPreview.vue'
 import SplitLoading from '@/components/features/app/workspace/SplitLoading.vue'
 import QuestionList from '@/components/features/app/question/QuestionList.vue'
@@ -13,9 +12,6 @@ import { renderMarkdown, typesetMath } from '@/utils/index'
 
 const props = defineProps({
   uploadMode: String,
-  eraseLoading: Boolean,
-  eraseDone: Boolean,
-  eraseImages: Array,
   ocrLoading: Boolean,
   ocrDone: Boolean,
   ocrPages: Array,
@@ -25,6 +21,7 @@ const props = defineProps({
   selectedIds: Set,
   previewUrl: String,
   notePreview: Object,
+  modelName: String,
 })
 
 const emit = defineEmits([
@@ -50,20 +47,13 @@ defineExpose({
 </script>
 
 <template>
-  <!-- 擦除加载中 / 擦除对比预览 -->
-  <ErasePreview
-    v-if="eraseLoading || (eraseDone && !ocrLoading && !ocrDone)"
-    :images="eraseImages"
-    :loading="eraseLoading"
-    :preview-url="previewUrl"
-  />
-
-  <!-- OCR 加载中 / OCR 预览 -->
+  <!-- OCR 加载中 / 识别结果预览 -->
   <OcrPreview
-    v-else-if="ocrLoading || (ocrDone && !splitCompleted && !splitting)"
+    v-if="ocrLoading || (ocrDone && !splitCompleted && !splitting)"
     :pages="ocrPages"
     :loading="ocrLoading"
     :preview-url="previewUrl"
+    :model-name="modelName"
   />
 
   <!-- 分割进行中 -->

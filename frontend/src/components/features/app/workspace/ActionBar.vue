@@ -11,7 +11,6 @@ const props = defineProps({
   splitCompleted: { type: Boolean, default: false },
   uploadMode: { type: String, default: 'exam' },
   workflowMode: { type: String, default: 'manual' },
-  eraseEnabled: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['split', 'export', 'save-to-db'])
@@ -53,8 +52,8 @@ const emit = defineEmits(['split', 'export', 'save-to-db'])
           <span class="text-gray-900 dark:text-white">{{ uploadMode === 'note' ? '整理已完成' : '解析已完成' }}</span>
         </template>
         <template v-else>
-          <i class="fa-solid text-gray-600 dark:text-white/80" :class="uploadMode === 'note' ? 'fa-book-open' : eraseEnabled ? 'fa-eraser' : 'fa-eye'"></i>
-          <span class="text-gray-900 dark:text-white">{{ uploadMode === 'note' ? '启动 AI 笔记整理' : eraseEnabled ? '开始擦除笔迹' : '开始 OCR 识别' }}</span>
+          <i class="fa-solid text-gray-600 dark:text-white/80" :class="uploadMode === 'note' ? 'fa-book-open' : 'fa-eye'"></i>
+          <span class="text-gray-900 dark:text-white">{{ uploadMode === 'note' ? '启动 AI 笔记整理' : '开始识别' }}</span>
         </template>
       </span>
     </button>

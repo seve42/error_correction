@@ -2,24 +2,21 @@ import { ref } from 'vue'
 import * as api from '@/api/index'
 import { useAuth } from '@/composables/useAuth'
 import { useProjects } from '@/composables/useProjects'
+import { buildGeneratedAnswerQuestion, composeAnswerWithReasoning } from '@/utils/index'
 import type { NotePreview } from '@/types/domain'
 
 const QUOTA_EXCEEDED_CODE = 'DAILY_FREE_QUOTA_EXCEEDED'
 
 /**
  * useSplitPipeline.js
- * 串联“擦除空白、OCR、AI 分割、笔记整理、导出、入库”的工作台主流程。
+ * 串联“视觉 OCR、AI 分割、笔记整理、导出、入库”的工作台主流程。
  */
 export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, splitting, splitCompleted, uploadMode, selectedLlmOption, questions, selectedIds, pendingFiles, typesetMath) {
   const { setQuotaSnapshot, refreshCurrentUser } = useAuth()
   const { activeQuestionProjectId, loadProjects } = useProjects()
-  const eraseLoading = ref(false)
-  const eraseImages = ref([])
-  const eraseDone = ref(false)
   const ocrLoading = ref(false)
   const ocrPages = ref([])
   const ocrDone = ref(false)
-  const eraseEnabled = ref(true)
   const notePreview = ref<NotePreview | null>(null)
   const currentRunId = ref(null)
   const currentSplitRecordId = ref(null)
@@ -48,76 +45,35 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
   }
 
   /**
-   * 根据是否启用擦除，决定从擦除步骤还是 OCR 步骤开始。
+   * 试卷模式直接从视觉 OCR 开始，笔记模式同样先识别再整理。
    */
   const startProcess = () => {
-    if (uploadMode.value === 'note') {
-      doOcr()
-      return
-    }
-    if (eraseEnabled.value) {
-      doErase()
-    } else {
-      doOcr()
-    }
+    doOcr()
   }
 
   /**
-   * 调用后端擦除接口，生成去除手写痕迹后的预览图。
-   */
-  const doErase = async () => {
-    if (uploadMode.value === 'note') return false
-    if (eraseLoading.value) return false
-    eraseLoading.value = true
-    eraseDone.value = false
-    eraseImages.value = []
-    currentView.value = 'workspace_review'
-    step.value = S.value.ERASE
-    try {
-      const data = await api.runErase()
-      eraseImages.value = data.images || []
-      eraseDone.value = true
-      await refreshQuotaSnapshot()
-      pushToast('success', data.message || '擦除完成')
-      return true
-    } catch (e) {
-      if (syncQuotaFromError(e)) {
-        pushToast('error', e.message || '今日免费体验次数已用完')
-      } else {
-        pushToast('error', e.message || '擦除失败')
-      }
-      currentView.value = 'workspace'
-      step.value = S.value.UPLOAD
-      return false
-    } finally {
-      eraseLoading.value = false
-    }
-  }
-
-  /**
-   * 调用 OCR 接口识别上传图片或 PDF，并同步扣减后的额度。
+   * 调用视觉 OCR 接口识别上传图片或 PDF，并同步扣减后的额度。
    */
   const doOcr = async () => {
     if (ocrLoading.value) return false
     ocrLoading.value = true
     ocrDone.value = false
     ocrPages.value = []
-    eraseDone.value = false
     notePreview.value = null
     currentView.value = 'workspace_review'
     step.value = S.value.OCR
     try {
-      const data = await api.runOcr()
+      const data = await api.runOcr('vision')
       ocrPages.value = data.pages || []
       ocrDone.value = true
       await refreshQuotaSnapshot()
-      pushToast('success', `OCR 完成，共 ${data.pages?.length || 0} 页`)
+      pushToast('success', `视觉识别完成，共 ${data.pages?.length || 0} 页`)
       return true
     } catch (e) {
       if (syncQuotaFromError(e)) {
         pushToast('error', e.message || '今日免费体验次数已用完')
       } else {
-        pushToast('error', e.message || 'OCR 失败')
+        pushToast('error', e.message || '识别失败')
       }
       currentView.value = 'workspace'
       step.value = S.value.UPLOAD
@@ -148,7 +104,8 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
         selectedLlmOption.value?.category || 'openai',
         selectedLlmOption.value?.model_name || '',
         selectedLlmOption.value?.source || '',
-        selectedLlmOption.value?.provider_id || ''
+        selectedLlmOption.value?.provider_id || '',
+        'vision',
       )
       currentRunId.value = data.run_id || null
       currentSplitRecordId.value = null
@@ -195,11 +152,6 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
       if (uploadMode.value === 'note') {
         await doNoteOrganize()
         return
-      }
-
-      if (eraseEnabled.value) {
-        const erased = await doErase()
-        if (!erased) return
       }
 
       const ocrOk = await doOcr()
@@ -323,6 +275,53 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
   }
 
   /**
+   * 为已选中的题目批量生成标准答案与解析，写回本地题目（answer 字段）。
+   * 导入错题库前按需调用；生成结果会随 doSaveToDb 的 answers 一并入库。
+   */
+  const generateSelectedAnswers = async () => {
+    const targets = questions.value.filter(q => selectedIds.has(q.uid))
+    if (!targets.length) { pushToast('error', '请至少选择一道题目！'); return false }
+    const option = selectedLlmOption?.value
+    if (!option?.category || !option?.model_name) {
+      pushToast('error', '请先在顶部选择一个可用模型')
+      return false
+    }
+    try {
+      const payloads = targets.map(q => buildGeneratedAnswerQuestion(q))
+      const results = await api.generateAnswers(payloads, {
+        modelProvider: option.category,
+        modelName: option.model_name,
+        providerSource: option.source,
+        providerId: option.provider_id,
+      })
+      // 后端保证结果顺序与请求一致，按索引回填
+      let filled = 0
+      targets.forEach((q, index) => {
+        const result = results[index]
+        if (!result) return
+        const text = composeAnswerWithReasoning(result.answer, result.reasoning)
+        if (!text) return
+        q.answer = text
+        filled += 1
+      })
+      if (!filled) {
+        pushToast('error', 'AI 未返回有效答案，请稍后重试')
+        return false
+      }
+      if (filled < targets.length) {
+        pushToast('success', `已生成 ${filled} 道题的标准答案解析，${targets.length - filled} 道题未生成`)
+      } else {
+        pushToast('success', `已生成 ${filled} 道题的标准答案解析`)
+      }
+      if (typeof typesetMath === 'function') await typesetMath()
+      return true
+    } catch (e) {
+      pushToast('error', '生成标准答案解析失败: ' + (e instanceof Error ? e.message : String(e)))
+      return false
+    }
+  }
+
+  /**
    * 把选中的错题保存到当前错题库，并刷新错题库页面。
    */
   const doSaveToDb = async (targetProjectId, errorBankRef) => {
@@ -345,8 +344,8 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
   }
 
   return {
-    eraseEnabled, eraseLoading, eraseImages, eraseDone,
     ocrLoading, ocrPages, ocrDone, notePreview, autoProcessing,
-    startProcess, runAutoProcess, doErase, doOcr, doSplit, doExport, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
+    startProcess, runAutoProcess, doOcr, doSplit, doExport, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
+    generateSelectedAnswers,
   }
 }

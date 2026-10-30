@@ -125,6 +125,7 @@ def client(test_db):
         patch("routes.device.SessionLocal", fake),
         patch("routes.chat.SessionLocal", fake),
         patch("routes.auth.SessionLocal", fake),
+        patch("db.SessionLocal", fake),
     ):
         from web_app import app
 
@@ -316,6 +317,11 @@ class TestSplitQuotaRules:
         from core.state import clear_user_session, get_user_session
 
         clear_user_session(TEST_USER_ID)
+        monkeypatch.setattr("core.config.settings.daily_free_quota", 100)
+        user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
+        user.daily_free_quota = 100
+        user.daily_free_used = 0
+        test_db.commit()
         pdf_one = tmp_path / "sample-2.pdf"
         pdf_two = tmp_path / "sample-4.pdf"
         pdf_one.write_bytes(b"%PDF-1.4 fake pdf one")
@@ -414,7 +420,8 @@ class TestSplitQuotaRules:
 
         user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
         test_db.refresh(user)
-        assert user.daily_free_used == 12
+        # 本地擦除免费；系统分割按实际费用折点，无用量时按最低 1 点计
+        assert user.daily_free_used == 1
 
     def test_split_consumes_one_quota_per_ocr_page(self, client, test_db, tmp_path, monkeypatch):
         from core.state import clear_user_session, get_user_session
@@ -431,6 +438,7 @@ class TestSplitQuotaRules:
         us["session_file_order"] = ["file-1"]
 
         user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
+        monkeypatch.setattr("core.config.settings.daily_free_quota", 100)
         user.daily_free_quota = 100
         user.daily_free_used = 0
         test_db.commit()
@@ -479,7 +487,7 @@ class TestSplitQuotaRules:
         assert data["success"] is True
 
         test_db.refresh(user)
-        assert user.daily_free_used == 3
+        assert user.daily_free_used == 1
 
     def test_split_rejects_when_remaining_quota_is_less_than_cached_page_count(self, client, test_db, tmp_path, monkeypatch):
         from core.state import clear_user_session, get_user_session
@@ -504,8 +512,10 @@ class TestSplitQuotaRules:
         monkeypatch.setattr("routes.upload._ocr_cache_path", lambda user_id: str(cache_path))
 
         user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
+        # 测试固定使用默认 100 次额度，避免受部署环境 APP_DAILY_FREE_QUOTA 影响
+        monkeypatch.setattr("core.config.settings.daily_free_quota", 100)
         user.daily_free_quota = 100
-        user.daily_free_used = 98
+        user.daily_free_used = 100
         user.daily_free_quota_date = datetime.utcnow().date().isoformat()
         test_db.commit()
 
@@ -522,9 +532,9 @@ class TestSplitQuotaRules:
         data = resp.get_json()
         assert data["success"] is False
         assert data["code"] == "DAILY_FREE_QUOTA_EXCEEDED"
-        assert data["required_amount"] == 3
-        assert data["quota"]["remaining"] == 2
-        assert "需要 3 个额度" in data["error"]
+        assert data["required_amount"] == 1
+        assert data["quota"]["remaining"] == 0
+        assert "需要 1 点" in data["error"]
 
 
 # ── POST /api/notes/ ─────────────────────────────────────
@@ -1236,8 +1246,10 @@ class TestAuthProfileRoutes:
         assert data["user"]["nickname"] == "小测"
         assert data["user"]["avatar_url"] == "/uploads/avatars/test-avatar.png"
 
-    def test_auth_me_returns_quota_snapshot(self, client, test_db):
+    def test_auth_me_returns_quota_snapshot(self, client, test_db, monkeypatch):
         user = test_db.query(User).filter(User.id == TEST_USER_ID).first()
+        # 测试固定使用默认 100 次额度，避免受部署环境 APP_DAILY_FREE_QUOTA 影响
+        monkeypatch.setattr("core.config.settings.daily_free_quota", 100)
         user.daily_free_quota = 5
         user.daily_free_used = 2
         user.daily_free_quota_date = "2000-01-01"
@@ -1271,9 +1283,9 @@ class TestAuthProfileRoutes:
                 ),
                 QuotaUsageEvent(
                     user_id=user.id,
-                    action_type="erase",
+                    action_type="split",
                     amount=3,
-                    summary="擦除笔记",
+                    summary="分割题目",
                     quota_date=(today - timedelta(days=1)).isoformat(),
                     created_at=datetime.utcnow() - timedelta(days=1),
                 ),
@@ -1297,7 +1309,7 @@ class TestAuthProfileRoutes:
         assert len(daily_chart["days"]) == 14
         assert daily_chart["actions"][0]["key"] == "chat"
         assert daily_chart["days"][-3]["chat"] == 2
-        assert daily_chart["days"][-2]["erase"] == 3
+        assert daily_chart["days"][-2]["split"] == 3
         assert daily_chart["days"][-1]["split"] == 5
         assert daily_chart["days"][-1]["total"] == 5
 

@@ -75,6 +75,27 @@ class QuotaUsageEvent(Base):
     user = relationship("User", back_populates="quota_usage_events")
 
 
+class ModelUsageEvent(Base):
+    """One model request's token usage and cost (all providers, billable or not)."""
+    __tablename__ = "model_usage_events"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    provider_source = Column(String(16), default="", nullable=False)
+    provider = Column(String(20), default="", nullable=False)
+    model_name = Column(String(128), default="", nullable=False, index=True)
+    action_type = Column(String(32), default="other", nullable=False, index=True)
+    run_id = Column(String(64), nullable=True)
+    prompt_tokens = Column(Integer, default=0, nullable=False)
+    cached_tokens = Column(Integer, default=0, nullable=False)
+    completion_tokens = Column(Integer, default=0, nullable=False)
+    total_tokens = Column(Integer, default=0, nullable=False)
+    cost_micro_yuan = Column(Integer, default=0, nullable=False)
+    billable = Column(Boolean, default=False, nullable=False)
+    quota_date = Column(String(10), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class DeviceBinding(Base):
     """Hardware camera binding owned by a user."""
     __tablename__ = "device_bindings"
@@ -209,6 +230,8 @@ class Question(Base):
     has_formula = Column(Boolean, default=False)
     has_image = Column(Boolean, default=False)
     image_refs_json = Column(Text)
+    # 题目所在整页原图引用（/api/question-image/...），供前端展示整页
+    page_image_ref = Column(Text, nullable=True)
     needs_correction = Column(Boolean, default=False)
     ocr_issues_json = Column(Text)
     user_answer = Column(Text, nullable=True)

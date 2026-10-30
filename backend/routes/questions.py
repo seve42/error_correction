@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import logging
 import uuid
@@ -12,7 +12,7 @@ from db.models import Question, UploadBatch, KnowledgeTag
 from core.config import settings
 from core import workflow_run_store as run_store
 from core.state import session_lock, get_user_session
-from pipeline.utils import export_wrongbook as export_wrongbook_md
+from pipeline.utils import export_wrongbook as export_wrongbook_md, organize_question_images
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,8 @@ def _serialize_question_detail(q: Question) -> dict:
     base['updated_at'] = q.updated_at.isoformat() if q.updated_at else None
     base['review_status'] = q.review_status or '待复习'
     base['image_refs_json'] = json.loads(q.image_refs_json) if q.image_refs_json else None
+    # 整页原图引用（前端用该字段展示整页图片）
+    base['page_image'] = q.page_image_ref
     return base
 
 
@@ -557,6 +559,9 @@ def save_to_db():
                     sq['answer'] = answers_map[uid]['answer']
                 if 'user_answer' in answers_map[uid]:
                     sq['user_answer'] = answers_map[uid]['user_answer']
+
+        # 把题目配图（裁剪图 / 整页图）整理到持久目录并重写为 /api/question-image/ 引用
+        organize_question_images(selected_questions)
 
         batch_info = {
             "original_filename": ", ".join(file_names) or "Unknown",

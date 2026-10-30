@@ -119,6 +119,9 @@ def _migrate_schema():
         if 'project_id' not in columns:
             cursor.execute("ALTER TABLE questions ADD COLUMN project_id INTEGER")
             conn.commit()
+        if 'page_image_ref' not in columns:
+            cursor.execute("ALTER TABLE questions ADD COLUMN page_image_ref TEXT")
+            conn.commit()
         review_columns = {
             "review_due_at": "DATETIME",
             "review_last_at": "DATETIME",

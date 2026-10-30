@@ -1,12 +1,14 @@
 <script setup lang="ts">
 /**
  * QuestionDetailModal.vue
- * 题目详情弹窗（查看题目内容、答案、AI 解题与对话）
+ * 题目详情弹窗（查看题目内容、答案、生成解析与对话）
  */
-import { ref, computed, watch, nextTick, onBeforeUnmount } from 'vue'
-import { isHtml, sanitizeHtml, formatOption } from '@/utils/index'
+import { ref, computed, watch } from 'vue'
 import * as api from '@/api/index'
 import { useSystemStatus } from '@/composables/useSystemStatus'
+import RichContent from '@/components/features/app/shared/RichContent.vue'
+import BasePopconfirm from '@/components/base/BasePopconfirm.vue'
+import { buildGeneratedAnswerQuestion, composeAnswerWithReasoning } from '@/utils/index'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -29,36 +31,22 @@ const extraImages = computed(() => {
   })
 })
 
-const emit = defineEmits(['close', 'open-image', 'deleted', 'answer-saved', 'review-status-changed', 'push-toast', 'start-chat'])
+const emit = defineEmits(['close', 'open-image', 'deleted', 'answer-saved', 'correct-answer-saved', 'review-status-changed', 'push-toast', 'start-chat'])
 const { selectedLlmOption } = useSystemStatus()
 
-const activeTab = ref('content') // 'content' | 'analysis'
 const userAnswer = ref('')
 const isSaving = ref(false)
 const answerText = ref('')
 const isAnswerSaving = ref(false)
-
-// AI 分析相关
-const isAnalyzing = ref(false)
-const aiReport = ref(null)
-const typedText = ref('')
-let typingTimer = null
-
-const typeset = async () => {
-  await nextTick()
-  if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
-    window.MathJax.typesetPromise()
-  }
-}
+const generatingAnswer = ref(false)
+const hasAnswer = computed(() => Boolean(String(props.question?.answer || '').trim()))
+const modelReady = computed(() => Boolean(selectedLlmOption.value?.category && selectedLlmOption.value?.model_name))
+const generateHint = computed(() => (modelReady.value ? '' : '请先在设置中选择模型'))
 
 watch(() => props.open, (newVal) => {
   if (newVal && props.question) {
     userAnswer.value = props.question.user_answer || ''
     answerText.value = props.question.answer || ''
-    activeTab.value = 'content'
-    aiReport.value = null
-    typedText.value = ''
-    typeset()
   }
 })
 
@@ -90,52 +78,38 @@ const saveCorrectAnswer = async () => {
   }
 }
 
-const triggerAiAnalysis = async () => {
-  if (!props.question) return
-  isAnalyzing.value = true
-  activeTab.value = 'analysis'
-  aiReport.value = null
-  typedText.value = ''
+/** 用当前选中模型生成标准答案与解析，并保存到题目上。 */
+const generateStandardAnswer = async () => {
+  if (!props.question || generatingAnswer.value) return
+  const option = selectedLlmOption.value
+  if (!option?.category || !option?.model_name) {
+    emit('push-toast', 'error', '请先在顶部选择一个可用模型')
+    return
+  }
+  generatingAnswer.value = true
   try {
-    const data = await api.requestAiAnalysis([props.question.id], {
-      modelProvider: selectedLlmOption.value?.category,
-      modelName: selectedLlmOption.value?.model_name,
-      providerSource: selectedLlmOption.value?.source,
-      providerId: selectedLlmOption.value?.provider_id,
+    const payload = buildGeneratedAnswerQuestion(props.question)
+    const results = await api.generateAnswers([payload], {
+      modelProvider: option.category,
+      modelName: option.model_name,
+      providerSource: option.source,
+      providerId: option.provider_id,
     })
-    const a = data.analysis || {}
-    const pq = (a.per_question || []).find(function (p) { return p.question_id === props.question.id })
-    aiReport.value = {
-      diagnostic: pq ? pq.diagnosis : (a.summary || '\u6682\u65e0\u8bca\u65ad\u4fe1\u606f'),
-      steps: a.suggestions || [],
-      advice: pq ? pq.hint : ''
-    }
-    startTyping()
+    const result = results[0]
+    if (!result) throw new Error('后端未返回生成结果')
+    const text = composeAnswerWithReasoning(result.answer, result.reasoning)
+    if (!text) throw new Error('生成结果为空')
+    const data = await api.saveQuestionAnswer(props.question.id, text)
+    answerText.value = text
+    props.question.answer = text
+    emit('correct-answer-saved', props.question.id, text, data?.updated_at)
+    emit('push-toast', 'success', '已生成标准答案解析')
   } catch (e) {
-    emit('push-toast', 'error', 'AI \u5206\u6790\u5931\u8d25: ' + (e instanceof Error ? e.message : String(e)))
+    emit('push-toast', 'error', e instanceof Error ? e.message : '生成标准答案解析失败')
   } finally {
-    isAnalyzing.value = false
+    generatingAnswer.value = false
   }
 }
-
-const startTyping = () => {
-  let i = 0
-  const str = aiReport.value.diagnostic
-  const tick = () => {
-    if (i < str.length) {
-      typedText.value += str.charAt(i)
-      i++
-      typingTimer = setTimeout(tick, 20)
-    } else {
-      typeset()
-    }
-  }
-  tick()
-}
-
-onBeforeUnmount(() => {
-  if (typingTimer) clearTimeout(typingTimer)
-})
 
 const doDelete = async () => {
   if (!window.confirm('确定要从题库中永久删除这道题吗？')) return
@@ -225,13 +199,9 @@ const reviewStatusOptions = [
               <!-- 核心题干 -->
               <div class="question-view">
                 <template v-for="(b, i) in question?.content_json" :key="i">
-                  <div v-if="b.block_type === 'text' && isHtml(b.content)" v-html="sanitizeHtml(b.content)"
-                    class="question-text mb-6 text-[15px] font-medium leading-relaxed text-slate-800 dark:text-slate-200">
-                  </div>
-                  <p v-else-if="b.block_type === 'text'"
-                    class="mb-6 text-[15px] font-medium leading-relaxed text-slate-800 dark:text-slate-200">{{ b.content
-                    }}
-                  </p>
+                  <RichContent v-if="b.block_type === 'text'"
+                    class="mb-6 text-[15px] font-medium leading-relaxed text-slate-800 dark:text-slate-200"
+                    :content="b.content" />
                   <img v-else-if="b.block_type === 'image'" :src="b.content"
                     class="mb-6 max-w-full cursor-zoom-in rounded-xl border border-slate-200 shadow-sm dark:border-white/10"
                     @click="emit('open-image', b.content)" />
@@ -248,104 +218,100 @@ const reviewStatusOptions = [
                 <div v-if="question?.options_json" class="mt-8 grid gap-3">
                   <div v-for="(opt, idx) in question.options_json" :key="idx"
                     class="rounded-xl border border-slate-100 bg-slate-50/50 p-4 text-[15px] font-medium text-slate-700 dark:border-white/5 dark:bg-white/5 dark:text-slate-300">
-                    {{ formatOption(opt) }}
+                    <RichContent :content="String(opt ?? '')" />
                   </div>
+                </div>
+
+                <!-- 整页原图：视觉 OCR 识别时保留原始页面，便于核对裁剪区域 -->
+                <div v-if="question?.page_image" class="mt-8">
+                  <div class="mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-slate-400">
+                    <i class="fa-regular fa-image"></i>
+                    <span>整页原图</span>
+                  </div>
+                  <img :src="question.page_image"
+                    class="max-h-40 max-w-full cursor-zoom-in rounded-xl border border-slate-200 object-contain transition-transform hover:scale-[1.01] dark:border-white/10"
+                    @click="emit('open-image', question.page_image)" />
                 </div>
               </div>
             </div>
 
-            <!-- 右侧：交互与分析 (侧边栏) -->
+            <!-- 右侧：笔记与答案解析 -->
             <div class="flex w-full flex-col overflow-hidden bg-white md:w-[400px] dark:bg-[#1b1b1d]">
-              <!-- Tab 切换 -->
-              <div class="flex shrink-0 border-b border-slate-100 dark:border-white/5">
-                <button @click="activeTab = 'content'"
-                  class="flex-1 py-4 text-xs font-black uppercase tracking-widest transition-all"
-                  :class="activeTab === 'content' ? 'border-b-2 border-[rgb(var(--accent-rgb))] accent-text' : 'text-slate-400'">我的笔记</button>
-                <button @click="activeTab = 'analysis'"
-                  class="flex-1 py-4 text-xs font-black uppercase tracking-widest transition-all"
-                  :class="activeTab === 'analysis' ? 'border-b-2 border-[rgb(var(--accent-rgb))] accent-text' : 'text-slate-400'">AI
-                  深度解析</button>
+              <div class="flex shrink-0 border-b border-slate-100 py-4 dark:border-white/5">
+                <span class="px-6 text-xs font-black uppercase tracking-widest accent-text">我的笔记</span>
               </div>
 
-              <div class="min-h-0 flex-1 overflow-y-auto p-6 pb-8">
-                <!-- Tab 1: 笔记与答案 -->
-                <div v-if="activeTab === 'content'" class="space-y-6">
-                  <!-- 正确答案 -->
-                  <div>
-                    <label
-                      class="mb-3 block text-[10px] font-black uppercase tracking-widest text-emerald-500 dark:text-emerald-400">
-                      <i class="fa-solid fa-circle-check mr-1"></i>正确答案/解析
-                    </label>
-                    <textarea v-model="answerText" rows="4" placeholder="录入正确答案或标准解析…（支持 Markdown / LaTeX）"
-                      class="w-full rounded-lg border border-slate-200 bg-white p-4 text-sm font-medium outline-none transition-all focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/5 dark:border-white/5 dark:bg-white/5 dark:text-white"></textarea>
-                  </div>
-                  <button @click="saveCorrectAnswer" :disabled="isAnswerSaving" class="btn-success w-full h-12">
-                    <i class="fa-solid" :class="isAnswerSaving ? 'fa-circle-notch fa-spin' : 'fa-save'"></i>
-                    {{ isAnswerSaving ? '同步中...' : '保存正确答案' }}
-                  </button>
-
-                  <div class="my-2 border-t border-slate-100 dark:border-white/5"></div>
-
-                  <!-- 用户笔记 -->
-                  <div>
-                    <label class="mb-3 block text-[10px] font-black uppercase tracking-widest text-slate-400">
-                      <i class="fa-solid fa-pen-to-square mr-1"></i>我的错因/心得笔记
-                    </label>
-                    <textarea v-model="userAnswer" rows="4" placeholder="记录下当时的解题思路，或者标记这里错在哪里了..."
-                      class="w-full rounded-lg border border-slate-200 bg-white p-4 text-sm font-medium outline-none transition-all focus:border-[rgb(var(--accent-rgb)/0.4)] focus:ring-4 focus:ring-[rgb(var(--accent-rgb)/0.05)] dark:border-white/5 dark:bg-white/5 dark:text-white"></textarea>
-                  </div>
-                  <button @click="saveAnswer" :disabled="isSaving" class="btn-primary w-full h-12">
-                    <i class="fa-solid" :class="isSaving ? 'fa-circle-notch fa-spin' : 'fa-save'"></i>
-                    {{ isSaving ? '同步中...' : '保存学习笔记' }}
-                  </button>
-                  <button @click="triggerAiAnalysis"
-                    class="group flex w-full items-center justify-center gap-2 rounded-lg border accent-border accent-bg-muted py-4 text-sm font-black accent-text transition-all hover:bg-[rgb(var(--accent-rgb)/0.12)]">
-                    <i class="fa-solid fa-wand-magic-sparkles animate-pulse"></i> 召唤 AI 助教分析
-                  </button>
-                  <button @click="emit('start-chat', question); emit('close')"
-                    class="group flex w-full items-center justify-center gap-2 rounded-lg border accent-border accent-bg-muted py-4 text-sm font-black accent-text transition-all hover:bg-[rgb(var(--accent-rgb)/0.12)]">
-                    <i class="fa-solid fa-comments"></i> AI 辅导对话
-                  </button>
-                </div>
-
-                <!-- Tab 2: AI 解析报告 -->
-                <div v-else class="space-y-6">
-                  <div v-if="isAnalyzing" class="flex flex-col items-center justify-center py-20">
-                    <div
-                      class="mb-4 h-12 w-12 animate-bounce rounded-full accent-bg-soft flex items-center justify-center">
-                      <i class="fa-solid fa-brain accent-text"></i>
+              <div class="min-h-0 flex-1 overflow-y-auto p-6 pb-8 space-y-6">
+                <!-- 正确答案 -->
+                <div>
+                  <label
+                    class="mb-3 block text-[10px] font-black uppercase tracking-widest text-emerald-500 dark:text-emerald-400">
+                    <i class="fa-solid fa-circle-check mr-1"></i>正确答案/解析
+                  </label>
+                  <textarea v-model="answerText" rows="4" placeholder="录入正确答案或标准解析…（支持 Markdown / LaTeX）"
+                    class="w-full rounded-lg border border-slate-200 bg-white p-4 text-sm font-medium outline-none transition-all focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/5 dark:border-white/5 dark:bg-white/5 dark:text-white"></textarea>
+                  <div v-if="answerText.trim()"
+                    class="mt-3 rounded-lg border border-emerald-100 bg-emerald-50/40 p-3 dark:border-emerald-500/20 dark:bg-emerald-500/[0.05]">
+                    <div class="mb-2 text-[10px] font-black uppercase tracking-widest text-emerald-500/80 dark:text-emerald-400/80">
+                      解析预览
                     </div>
-                    <p class="text-xs font-black uppercase tracking-widest accent-text animate-pulse">分析中...</p>
-                  </div>
-                  <div v-else-if="aiReport" class="space-y-8 animate-in slide-in-from-bottom-4 duration-500">
-                    <div class="rounded-xl border accent-border accent-bg-soft p-5">
-                      <h4 class="mb-3 flex items-center gap-2 text-xs font-black uppercase accent-text">
-                        <i class="fa-solid fa-microchip"></i> 认知诊断报告
-                      </h4>
-                      <p class="text-sm font-medium leading-relaxed text-slate-700 dark:text-slate-300">
-                        {{ typedText }}<span
-                          class="inline-block h-4 w-1 animate-blink accent-bg align-middle ml-1"></span>
-                      </p>
-                    </div>
-
-                    <div v-if="typedText.length > 10">
-                      <h4 class="mb-4 text-xs font-black uppercase tracking-widest text-slate-400">正确路径解构</h4>
-                      <div class="space-y-4 border-l-2 border-slate-200 pl-6 dark:border-white/10">
-                        <div v-for="(step, idx) in aiReport.steps" :key="idx" class="relative">
-                          <span
-                            class="absolute -left-[31px] flex h-[14px] w-[14px] items-center justify-center rounded-full accent-bg text-[8px] font-black text-white outline outline-4 outline-white dark:outline-[#0F111A]">
-                            {{ idx + 1 }}
-                          </span>
-                          <p class="text-sm font-bold text-slate-700 dark:text-slate-300">{{ step }}</p>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  <div v-else class="flex flex-col items-center justify-center py-20 text-slate-400">
-                    <i class="fa-solid fa-robot text-4xl mb-4 opacity-20"></i>
-                    <p class="text-xs font-bold uppercase tracking-widest">请先点击"召唤 AI 助教"</p>
+                    <RichContent class="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                      :content="answerText" />
                   </div>
                 </div>
+                <button @click="saveCorrectAnswer" :disabled="isAnswerSaving" class="btn-success w-full h-12">
+                  <i class="fa-solid" :class="isAnswerSaving ? 'fa-circle-notch fa-spin' : 'fa-save'"></i>
+                  {{ isAnswerSaving ? '同步中...' : '保存正确答案' }}
+                </button>
+
+                <div v-if="hasAnswer" class="flex justify-center">
+                  <BasePopconfirm title="重新生成标准答案解析？"
+                    description="将用 AI 生成的内容覆盖当前保存的答案与解析。" confirm-text="重新生成"
+                    @confirm="generateStandardAnswer">
+                    <button :disabled="generatingAnswer || !modelReady" :title="generateHint"
+                      class="group inline-flex items-center justify-center gap-2 rounded-lg border accent-border accent-bg-muted px-8 py-3 text-sm font-black accent-text transition-all hover:bg-[rgb(var(--accent-rgb)/0.12)] disabled:cursor-not-allowed disabled:opacity-60">
+                      <i class="fa-solid"
+                        :class="generatingAnswer ? 'fa-circle-notch fa-spin' : 'fa-wand-magic-sparkles'"></i>
+                      {{ generatingAnswer ? '生成中…' : 'AI 重新生成解析' }}
+                    </button>
+                  </BasePopconfirm>
+                </div>
+                <div v-else class="flex justify-center">
+                  <button :disabled="generatingAnswer || !modelReady" :title="generateHint" @click="generateStandardAnswer"
+                    class="group inline-flex items-center justify-center gap-2 rounded-lg border accent-border accent-bg-muted px-8 py-3 text-sm font-black accent-text transition-all hover:bg-[rgb(var(--accent-rgb)/0.12)] disabled:cursor-not-allowed disabled:opacity-60">
+                    <i class="fa-solid"
+                      :class="generatingAnswer ? 'fa-circle-notch fa-spin' : 'fa-wand-magic-sparkles'"></i>
+                    {{ generatingAnswer ? '生成中…' : 'AI 生成标准答案解析' }}
+                  </button>
+                </div>
+                <p v-if="!modelReady" class="text-center text-xs text-amber-600 dark:text-amber-400">
+                  请先在设置中选择模型
+                </p>
+
+                <div class="my-2 border-t border-slate-100 dark:border-white/5"></div>
+
+                <!-- 用户笔记 -->
+                <div>
+                  <label class="mb-3 block text-[10px] font-black uppercase tracking-widest text-slate-400">
+                    <i class="fa-solid fa-pen-to-square mr-1"></i>我的错因/心得笔记
+                  </label>
+                  <textarea v-model="userAnswer" rows="4" placeholder="记录下当时的解题思路，或者标记这里错在哪里了..."
+                    class="w-full rounded-lg border border-slate-200 bg-white p-4 text-sm font-medium outline-none transition-all focus:border-[rgb(var(--accent-rgb)/0.4)] focus:ring-4 focus:ring-[rgb(var(--accent-rgb)/0.05)] dark:border-white/5 dark:bg-white/5 dark:text-white"></textarea>
+                  <div v-if="userAnswer.trim()"
+                    class="mt-3 rounded-lg border border-slate-100 bg-slate-50/60 p-3 dark:border-white/5 dark:bg-white/[0.03]">
+                    <div class="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">笔记预览</div>
+                    <RichContent class="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                      :content="userAnswer" />
+                  </div>
+                </div>
+                <button @click="saveAnswer" :disabled="isSaving" class="btn-primary w-full h-12">
+                  <i class="fa-solid" :class="isSaving ? 'fa-circle-notch fa-spin' : 'fa-save'"></i>
+                  {{ isSaving ? '同步中...' : '保存学习笔记' }}
+                </button>
+                <button @click="emit('start-chat', question); emit('close')"
+                  class="group flex w-full items-center justify-center gap-2 rounded-lg border accent-border accent-bg-muted py-4 text-sm font-black accent-text transition-all hover:bg-[rgb(var(--accent-rgb)/0.12)]">
+                  <i class="fa-solid fa-comments"></i> AI 辅导对话
+                </button>
               </div>
             </div>
           </div>
@@ -380,48 +346,5 @@ const reviewStatusOptions = [
 .dialog-content-leave-to {
   opacity: 0;
   transform: scale(0.96) translateY(8px);
-}
-
-@keyframes blink {
-
-  0%,
-  100% {
-    opacity: 1;
-  }
-
-  50% {
-    opacity: 0;
-  }
-}
-
-.animate-blink {
-  animation: blink 0.8s infinite;
-}
-
-.question-text :deep(table) {
-  @apply my-6 w-full max-w-full rounded-xl border border-slate-200 bg-white/50 text-[14px] overflow-hidden dark:bg-white/[0.02] dark:border-white/10;
-  display: block;
-  overflow-x: auto;
-  white-space: nowrap;
-}
-
-.question-text :deep(th) {
-  @apply bg-slate-100/80 px-4 py-2.5 text-left font-bold text-slate-600 dark:bg-white/5 dark:text-slate-300 whitespace-nowrap;
-}
-
-.question-text :deep(td) {
-  @apply border-t border-slate-100/80 px-4 py-2.5 dark:border-white/10 dark:text-slate-300 whitespace-nowrap;
-}
-
-.question-text :deep(ul) {
-  @apply list-disc pl-5 my-2;
-}
-
-.question-text :deep(ol) {
-  @apply list-decimal pl-5 my-2;
-}
-
-.question-text :deep(a) {
-  @apply text-blue-600 hover:underline dark:text-blue-400;
 }
 </style>

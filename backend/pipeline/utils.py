@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import asyncio
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Any
@@ -17,6 +18,100 @@ from core.config import settings
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 console = Console()
+
+# 题目配图（图形裁剪与整页原图）的对外访问前缀，由 routes/upload.py 提供
+QUESTION_IMAGE_URL_PREFIX = "/api/question-image/"
+
+
+def _safe_join_under(root: str, relative: str) -> str | None:
+    """把相对路径拼到 root 下；越界（目录遍历）时返回 None。"""
+    root_abs = os.path.abspath(str(root))
+    target = os.path.abspath(os.path.join(root_abs, relative))
+    if target != root_abs and not target.startswith(root_abs + os.sep):
+        return None
+    return target
+
+
+def resolve_question_image_path(ref: str) -> str | None:
+    """把题目图片引用解析为磁盘文件路径，解析不到返回 None。
+
+    支持：
+    - /api/question-image/<rel>：question_images_dir 下的持久配图；
+    - /images/<name>、imgs/<name>：PaddleOCR 分支的 struct_dir/imgs 配图；
+    - 绝对文件路径（历史 split 结果中的真实图片路径）。
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    if ref.startswith(QUESTION_IMAGE_URL_PREFIX):
+        path = _safe_join_under(
+            settings.question_images_dir, ref[len(QUESTION_IMAGE_URL_PREFIX):]
+        )
+        return path if path and os.path.isfile(path) else None
+    if ref.startswith("/images/"):
+        candidate = os.path.join(
+            str(settings.struct_dir), "imgs", ref[len("/images/"):]
+        )
+    elif ref.startswith("imgs/"):
+        candidate = os.path.join(
+            str(settings.struct_dir), ref[len("imgs/"):]
+        )
+    elif os.path.isabs(ref):
+        candidate = ref
+    else:
+        return None
+    return candidate if os.path.isfile(candidate) else None
+
+
+def organize_question_images(questions: List[Dict[str, Any]]) -> None:
+    """入库前把题目图片复制到持久目录，并把引用重写为 /api/question-image/...。
+
+    幂等：已指向 /api/question-image/ 的引用不做处理；解析不到真实文件时保留原引用。
+    重写范围：image content_block 的 content、image_refs、page_image。
+    """
+    root = str(settings.question_images_dir)
+    for question in questions or []:
+        local_dir = None
+        copied: Dict[str, str] = {}
+
+        def _persist(ref):
+            nonlocal local_dir
+            url = (ref or "").strip()
+            if not url or url.startswith(QUESTION_IMAGE_URL_PREFIX):
+                return url
+            if url in copied:
+                return copied[url]
+            source = resolve_question_image_path(url)
+            if not source:
+                return url
+            if local_dir is None:
+                local_dir = uuid.uuid4().hex
+                os.makedirs(os.path.join(root, local_dir), exist_ok=True)
+            suffix = os.path.splitext(source)[1].lower() or ".jpg"
+            name = f"{uuid.uuid4().hex[:12]}{suffix}"
+            shutil.copyfile(source, os.path.join(root, local_dir, name))
+            new_url = f"{QUESTION_IMAGE_URL_PREFIX}{local_dir}/{name}"
+            copied[url] = new_url
+            return new_url
+
+        blocks = question.get("content_blocks") or []
+        has_image_block = False
+        for block in blocks:
+            if block.get("block_type") == "image":
+                has_image_block = True
+                block["content"] = _persist(block.get("content"))
+        image_refs = question.get("image_refs")
+        if isinstance(image_refs, list):
+            rewritten: List[str] = []
+            for ref in image_refs:
+                new_ref = _persist(ref)
+                if new_ref and new_ref not in rewritten:
+                    rewritten.append(new_ref)
+            question["image_refs"] = rewritten or None
+        if question.get("page_image"):
+            question["page_image"] = _persist(question.get("page_image"))
+        if has_image_block:
+            question["has_image"] = True
 
 
 def prepare_input(file_path: str) -> List[str]:
@@ -87,7 +182,11 @@ def export_wrongbook(
 
     # 用 uid 过滤选中的题目，保持原始顺序
     uid_set = set(selected_uids)
-    selected_questions = [q for q in questions if q.get('uid') in uid_set]
+    selected_questions = [
+        q
+        for q in questions
+        if q.get('uid') in uid_set or q.get('question_id') in uid_set
+    ]
 
     # 构建Markdown内容
     md_content = "# 错题本\n\n"
@@ -96,15 +195,21 @@ def export_wrongbook(
 
     output_dir = os.path.dirname(os.path.abspath(output_path))
     rel_struct_dir = os.path.relpath(settings.struct_dir, output_dir)
-    _img_src_re = re.compile(r'src="((?:/images/|imgs/)[^"]+)"')
+    rel_question_images_dir = os.path.relpath(settings.question_images_dir, output_dir)
+    _img_src_re = re.compile(
+        r'src="((?:/images/|imgs/|/api/question-image/)[^"]+)"'
+    )
 
     def _resolve_image_path(p: str) -> str:
         """将 Agent 输出的图片路径统一转为 Markdown 可用的相对路径。
 
         Agent 有时输出 '/images/xxx.jpg'（Flask 路由），有时输出 'imgs/xxx.jpg'
-        （LLM 对路径的自由变形），统一映射到 struct_dir/imgs/ 下的相对路径。
+        （LLM 对路径的自由变形），统一映射到 struct_dir/imgs/ 下的相对路径；
+        视觉分支的题目配图（/api/question-image/...）映射到 question_images 目录。
         """
         p = p.strip()
+        if p.startswith(QUESTION_IMAGE_URL_PREFIX):
+            return f"{rel_question_images_dir}/{p[len(QUESTION_IMAGE_URL_PREFIX):]}"
         if p.startswith("/images/"):
             return f"{rel_struct_dir}/imgs/{p[len('/images/'):]}"
         if p.startswith("imgs/"):
@@ -180,8 +285,33 @@ def export_wrongbook(
                 md_content += f"![图片]({_resolve_image_path(image_path)})\n\n"
 
         answer_prefix = "####" if section else "###"
+        my_answer = (q.get("student_answer") or "").strip()
         md_content += f"{answer_prefix} 我的答案\n\n"
-        md_content += "_（请在此处填写你的答案）_\n\n"
+        if my_answer:
+            md_content += f"{my_answer}\n\n"
+        else:
+            md_content += "_（请在此处填写你的答案）_\n\n"
+
+        grading = q.get("grading") or {}
+        if grading:
+            verdict_text = {
+                "correct": "判对",
+                "wrong": "判错",
+                "partial": "部分对",
+                "unknown": "待确认",
+            }.get(grading.get("verdict"), "")
+            grading_line = f"> 红笔批改：{verdict_text or '有标记'}"
+            annotation = (grading.get("annotation") or "").strip()
+            if annotation:
+                grading_line += f"；批注：{annotation}"
+            mark_texts = [
+                str(m.get("text") or m.get("type") or "").strip()
+                for m in (grading.get("marks") or [])
+                if (m.get("text") or m.get("type"))
+            ]
+            if mark_texts:
+                grading_line += "；标记：" + "、".join(dict.fromkeys(mark_texts))
+            md_content += grading_line + "\n\n"
 
         md_content += f"{answer_prefix} 正确答案\n\n"
         md_content += "_（请在此处填写正确答案）_\n\n"

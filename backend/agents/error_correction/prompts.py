@@ -46,7 +46,7 @@ SPLIT_PROMPT_LITE = """# 试卷题目分割
 
 ## 公式处理
 
-行内公式 $...$，独占行 $$...$$，嵌入 text 类型的 content 中。
+行内公式 $...$，独占行 $$...$$，嵌入 text 类型的 content 中。公式一律用 LaTeX，禁止输出纯文本公式或 Unicode 数学符号（≤、×、√、∵ 等）。
 
 ## 表格处理
 
@@ -150,6 +150,7 @@ SPLIT_PROMPT = """# 错题本题目分割专家
    - 不要将公式拆分为独立的 content_block（不要使用 display_formula 或 inline_formula 类型）
    - 所有公式直接用 LaTeX 标记嵌入 text 类型的 content 字段中
    - 行内公式使用 `$...$`，独占行公式使用 `$$...$$`
+   - 公式一律用 LaTeX，禁止输出纯文本公式或 Unicode 数学符号（≤、×、√、∵ 等）
    - 例如：`"content": "已知圆锥的底面半径为 $\\sqrt{3}$，则体积为 $$V = \\frac{1}{3}\\pi r^2 h$$"`
 
 7. **变量下标还原（重要）**

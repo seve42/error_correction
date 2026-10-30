@@ -5,7 +5,7 @@
  */
 import { ref, watch, nextTick } from 'vue'
 import * as api from '@/api/index'
-import { isHtml, sanitizeHtml, typesetMath as _typesetMath } from '@/utils/index'
+import { getQuestionSnippet, typesetMath as _typesetMath } from '@/utils/index'
 
 const props = defineProps({
   theme: { type: String, default: 'light' },
@@ -168,6 +168,11 @@ const questionTypeBadge = (t) => {
   return 'bg-slate-100 text-slate-600 dark:bg-slate-500/15 dark:text-slate-300'
 }
 
+/**
+ * 历史记录卡片宽度有限，题目内容按纯文本摘要展示，避免富文本撑破卡片。
+ */
+const summaryText = (q) => getQuestionSnippet(q, 220, '（无文本内容）')
+
 // ---- 初始化 ----
 watch(() => props.visible, (v) => {
   if (v) loadRecords()
@@ -297,12 +302,7 @@ defineExpose({ refresh: loadRecords })
                       </div>
                       <!-- 题目内容 -->
                       <div class="line-clamp-3 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
-                        <template v-if="(q.content_blocks || q.content_json)?.length">
-                          <template v-for="(b, i) in (q.content_blocks || q.content_json)" :key="i">
-                            <span v-if="b.block_type === 'text'" v-html="isHtml(b.content) ? sanitizeHtml(b.content) : b.content"></span>
-                          </template>
-                        </template>
-                        <span v-else class="italic text-slate-400 dark:text-slate-500">（无文本内容）</span>
+                        {{ summaryText(q) }}
                       </div>
                       <!-- 知识点标签 -->
                       <div v-if="q.knowledge_tags?.length" class="mt-2 flex flex-wrap gap-1">

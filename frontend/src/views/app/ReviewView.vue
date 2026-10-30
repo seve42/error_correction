@@ -1,15 +1,13 @@
 <script setup lang="ts">
 /**
  * ReviewView.vue
- * 待复习页面，集中展示需要复习的题目，并支持快速标记、补答案和 AI 分析。
+ * 待复习页面，集中展示需要复习的题目，并支持快速标记与补答案。
  */
-import { ref, watch, nextTick, onMounted, onBeforeUnmount, computed } from 'vue'
+import { ref, watch, nextTick, onMounted, computed } from 'vue'
 import * as api from '@/api/index'
 import { typesetMath as _typesetMath } from '@/utils/index'
-import { useSelectableList } from '@/composables/useSelectableList'
 import ContentPanel from '@/components/features/app/layout/ContentPanel.vue'
 import QuestionDetailModal from '@/components/features/app/question/QuestionDetailModal.vue'
-import AiAnalysisModal from '@/components/features/app/review/AiAnalysisModal.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import QuestionItem from '@/components/features/app/question/QuestionItem.vue'
 import { useToast } from '@/composables/useToast'
@@ -17,7 +15,6 @@ import { useImageModal } from '@/composables/useImageModal'
 import { useWorkspaceNav } from '@/composables/useWorkspaceNav'
 import { useChatSession } from '@/composables/useChatSession'
 import { useTheme } from '@/composables/useTheme'
-import { useSystemStatus } from '@/composables/useSystemStatus'
 import { useProjects } from '@/composables/useProjects'
 
 const { pushToast } = useToast()
@@ -25,7 +22,6 @@ const { openModal } = useImageModal()
 const { currentView } = useWorkspaceNav()
 const { openChat } = useChatSession()
 const { isDark } = useTheme()
-const { selectedLlmOption } = useSystemStatus()
 const { activeQuestionProjectId } = useProjects()
 const theme = computed(() => isDark.value ? 'dark' : 'light')
 
@@ -48,10 +44,7 @@ const detailOpen = ref(false)
 const detailQuestion = ref(null)
 
 // ---- AI 分析 ----
-const { selectMode, selectedIds, toggleSelectMode, toggleSelect, selectAllItems } = useSelectableList()
-const aiModalOpen = ref(false)
-const aiAnalysisResult = ref(null)
-const aiAnalyzing = ref(false)
+// （AI 错题分析入口已下线，api.requestAiAnalysis 仍保留在 api 层备用）
 
 // ---- 数据加载 ----
 /**
@@ -192,38 +185,9 @@ const onReviewStatusChanged = (id, status, updatedAt) => {
   }
 }
 
-const selectAllReview = () => selectAllItems(reviewItems.value)
-
-/**
- * 对已选题目发起 AI 分析，并把结果展示在分析弹窗中。
- */
-const startAiAnalysis = async () => {
-  if (!selectedIds.size) {
-    pushToast('error', '请先选择要分析的题目')
-    return
-  }
-  aiAnalyzing.value = true
-  aiModalOpen.value = true
-  aiAnalysisResult.value = null
-  try {
-    const data = await api.requestAiAnalysis(Array.from(selectedIds), {
-      modelProvider: selectedLlmOption.value?.category,
-      modelName: selectedLlmOption.value?.model_name,
-      providerSource: selectedLlmOption.value?.source,
-      providerId: selectedLlmOption.value?.provider_id,
-    })
-    aiAnalysisResult.value = data.analysis
-  } catch (e) {
-    pushToast('error', 'AI 分析失败: ' + (e instanceof Error ? e.message : String(e)))
-    aiModalOpen.value = false
-  } finally {
-    aiAnalyzing.value = false
-  }
-}
-
-const closeAiModal = () => {
-  aiModalOpen.value = false
-  aiAnalysisResult.value = null
+const onCorrectAnswerSaved = (id, answer, updatedAt) => {
+  const q = reviewItems.value.find(x => x.id === id)
+  if (q) { q.answer = answer; q.updated_at = updatedAt }
 }
 
 // ---- 生命周期 ----
@@ -250,24 +214,6 @@ onMounted(() => { loadAll() })
               class="ml-2 rounded-full accent-bg-soft px-2 py-1 text-xs font-bold accent-text">{{
               reviewTotal }}</span>
           </h3>
-          <div v-if="reviewItems.length" class="flex items-center gap-2">
-            <button @click="toggleSelectMode" class="rounded-xl border px-4 py-2 text-xs font-bold transition-all"
-              :class="selectMode ? 'border-blue-500 bg-blue-50 text-blue-600 dark:border-blue-400/30 dark:bg-blue-500/10 dark:text-blue-400' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-white/10 dark:bg-white/5 dark:text-slate-400'">
-              <i class="fa-solid mr-1" :class="selectMode ? 'fa-xmark' : 'fa-list-check'"></i>
-              {{ selectMode ? '取消选择' : '选择题目' }}
-            </button>
-            <template v-if="selectMode">
-              <button @click="selectAllReview"
-                class="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50 transition-all dark:border-white/10 dark:bg-white/5 dark:text-slate-400">
-                全选
-              </button>
-              <button @click="startAiAnalysis" :disabled="!selectedIds.size || aiAnalyzing"
-                class="rounded-xl accent-gradient-bg px-4 py-2 text-xs font-bold text-white shadow-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed">
-                <i class="fa-solid fa-wand-magic-sparkles mr-1" :class="{ 'animate-spin': aiAnalyzing }"></i>
-                AI 错题分析 <span v-if="selectedIds.size">({{ selectedIds.size }})</span>
-              </button>
-            </template>
-          </div>
         </div>
 
         <!-- 加载中 -->
@@ -285,9 +231,8 @@ onMounted(() => { loadAll() })
 
         <!-- 题目列表 -->
         <div v-else class="space-y-4">
-          <QuestionItem v-for="q in reviewItems" :key="q.id" :question="q" :selectable="selectMode"
-            :selected="selectedIds.has(q.id)" :max-tags="3" @click="selectMode ? toggleSelect(q.id) : openDetail(q)"
-            @toggle-select="toggleSelect">
+          <QuestionItem v-for="q in reviewItems" :key="q.id" :question="q" :max-tags="3"
+            @click="openDetail(q)">
             <template #extra="{ question }">
               <!-- 录入答案/笔记按钮 -->
               <div class="mt-3 flex flex-wrap items-center gap-2 text-xs" @click.stop>
@@ -355,11 +300,9 @@ onMounted(() => { loadAll() })
       <!-- 详情弹窗 -->
       <QuestionDetailModal :open="detailOpen" :question="detailQuestion" @close="closeDetail"
         @open-image="(src) => openModal(src)" @deleted="onDeleted" @answer-saved="onAnswerSaved"
+        @correct-answer-saved="onCorrectAnswerSaved"
         @review-status-changed="onReviewStatusChanged" @push-toast="(type, msg) => pushToast(type, msg)"
         @start-chat="(q) => openChat(q)" />
-
-      <!-- AI 分析弹窗 -->
-      <AiAnalysisModal :open="aiModalOpen" :loading="aiAnalyzing" :analysis="aiAnalysisResult" @close="closeAiModal" />
     </div>
   </ContentPanel>
 </template>

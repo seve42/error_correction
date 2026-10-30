@@ -1,4 +1,4 @@
-﻿"""
+"""
 笔记模块 API 路由
 
 流程：上传笔记图片 → PaddleOCR 识别 → LLM 整理 → 保存到数据库
@@ -14,7 +14,6 @@ from flask import Blueprint, request, jsonify, session
 
 from core.config import settings
 from core.quota import (
-    consume_daily_free_quota,
     has_daily_free_quota,
     quota_exceeded_response,
     uses_server_llm,
@@ -79,16 +78,6 @@ def _build_note_preview_payload(result, source_images: list[str], ocr_text: str)
         "source_images": list(source_images or []),
         "ocr_text": ocr_text,
     }
-
-
-def _consume_note_quota_if_needed(should_consume_quota: bool, user_id) -> None:
-    """在笔记整理链路成功产出结果后扣减免费额度。"""
-    if not should_consume_quota or not user_id:
-        return
-    with SessionLocal() as db:
-        quota_user = crud.get_user_by_id(db, user_id)
-        if quota_user:
-            consume_daily_free_quota(db, quota_user, action_type="note")
 
 
 def _serialize_note(note) -> dict:
@@ -189,6 +178,7 @@ def create_note():
 
     try:
         should_consume_quota = False
+        uses_server_side_llm = False
         with SessionLocal() as db:
             if project_id is not None:
                 try:
@@ -292,7 +282,14 @@ def create_note():
 
         # 3. LLM 整理
         from agents.note import invoke_note_organize
+        from core.usage import start_usage, end_usage
 
+        usage_ctx = start_usage(
+            user_id,
+            "note",
+            provider_source=llm_selection["source"],
+            system_stages={"llm"} if uses_server_side_llm else set(),
+        )
         # 使用解析出的 credentials 调用代理
         try:
             result = invoke_note_organize(
@@ -331,12 +328,13 @@ def create_note():
                     400,
                 )
             raise
+        finally:
+            end_usage(usage_ctx)
 
         note_preview = _build_note_preview_payload(result, saved_paths, ocr_text)
 
         # 4. 未选择笔记本时，仅返回整理结果供前端确认保存
         if project_id is None:
-            _consume_note_quota_if_needed(should_consume_quota, user_id)
             return jsonify({"success": True, "note_preview": note_preview}), 200
 
         # 5. 保存到数据库
@@ -361,8 +359,6 @@ def create_note():
                 project_id=project_id,
             )
             note_id = note.id
-
-        _consume_note_quota_if_needed(should_consume_quota, user_id)
 
         with SessionLocal() as db:
             note = crud.get_note_by_id(db, note_id, user_id=_effective_user_id())

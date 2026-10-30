@@ -3,9 +3,9 @@
  * QuestionItem.vue
  * 题目条目（分割结果列表项）
  */
-import { ref, watch, nextTick } from 'vue'
-import { getQuestionSnippet, typesetMath } from '@/utils/index'
+import { getQuestionSnippet } from '@/utils/index'
 import BaseCard from '@/components/base/BaseCard.vue'
+import RichContent from '@/components/features/app/shared/RichContent.vue'
 
 const props = defineProps({
   question: { type: Object, required: true },
@@ -17,16 +17,7 @@ const props = defineProps({
 
 const emit = defineEmits(['click', 'toggle-select'])
 
-const optionsEl = ref(null)
-
 const summary = () => getQuestionSnippet(props.question)
-
-watch(() => props.question.options_json, async (val) => {
-  if (val?.length && optionsEl.value) {
-    await nextTick()
-    typesetMath(optionsEl.value)
-  }
-}, { immediate: true, flush: 'post' })
 
 const tags = () => {
   const all = props.question.knowledge_tags || []
@@ -92,14 +83,14 @@ const statusIcon = (status) => {
         </div>
 
         <!-- 选择题选项 -->
-        <div v-if="question.options_json?.length" ref="optionsEl" class="mt-3 grid grid-cols-2 gap-1.5">
+        <div v-if="question.options_json?.length" class="mt-3 grid grid-cols-2 gap-1.5">
           <div
             v-for="(opt, idx) in question.options_json"
             :key="idx"
             class="flex items-start gap-2 rounded-md border border-gray-200 dark:border-white/[0.06] bg-gray-50 dark:bg-white/[0.02] px-3 py-1.5 text-xs font-medium text-gray-600 dark:text-[#8a8f98] transition-colors"
           >
             <span class="shrink-0 text-gray-400 dark:text-[#62666d] transition-colors">{{ String.fromCharCode(65 + idx) }}.</span>
-            <span class="line-clamp-1">{{ String(opt).replace(/^[A-Da-d][.、．]\s*/, '') }}</span>
+            <RichContent class="line-clamp-1 min-w-0" :content="String(opt).replace(/^[A-Da-d][.、．]\s*/, '')" />
           </div>
         </div>
 

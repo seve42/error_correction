@@ -458,6 +458,7 @@ def save_questions_to_db(
             has_formula=q.get("has_formula", False),
             has_image=q.get("has_image", False),
             image_refs_json=json.dumps(q.get("image_refs"), ensure_ascii=False) if q.get("image_refs") else None,
+            page_image_ref=q.get("page_image") or None,
             needs_correction=q.get("needs_correction", False),
             ocr_issues_json=json.dumps(q.get("ocr_issues"), ensure_ascii=False) if q.get("ocr_issues") else None,
             answer=q.get("answer") or None,

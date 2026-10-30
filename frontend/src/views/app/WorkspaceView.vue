@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * WorkspaceView.vue
- * 录入工作台 — 上传/擦除/OCR/分割/导出 全流程
+ * 录入工作台 — 上传/识别/分割/导出 全流程
  */
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -20,6 +20,7 @@ import ReviewStage from '@/components/features/app/workspace/ReviewStage.vue'
 import SplitHistory from '@/views/app/SplitHistoryView.vue'
 import BaseModal from '@/components/base/BaseModal.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
+import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseToolbarButton from '@/components/base/BaseToolbarButton.vue'
 
 defineOptions({ name: 'WorkspaceView' })
@@ -53,14 +54,12 @@ const splitting = ref(false)
 const splitCompleted = ref(false)
 const showSplitHistory = ref(false)
 
-const S = computed(() => {
-  const off = eraseEnabled.value ? 1 : 0
-  return { UPLOAD: 1, ERASE: 2, OCR: 2 + off, SPLIT: 3 + off, EXPORT: 4 + off }
-})
+// 擦除步骤已并入视觉 OCR，试卷模式固定为 上传 → 识别 → 分割 → 导出。
+const S = computed(() => ({ UPLOAD: 1, OCR: 2, SPLIT: 3, EXPORT: 4 }))
 const workspaceSteps = computed(() => {
   const labels = uploadMode.value === 'note'
     ? ['上传', 'OCR', '整理', '保存']
-    : (eraseEnabled.value ? ['上传', '擦除', 'OCR', '分割', '导出'] : ['上传', 'OCR', '分割', '导出'])
+    : ['上传', '识别', '分割', '导出']
   return labels.map((label, i) => ({
     label,
     done: i + 1 < step.value,
@@ -126,7 +125,9 @@ const restorePersistedWorkspaceState = async () => {
   splitCompleted.value = Boolean(state.splitCompleted)
   uploadMode.value = state.uploadMode === 'note' ? 'note' : 'exam'
   workflowMode.value = state.workflowMode === 'auto' ? 'auto' : 'manual'
-  step.value = Number(state.step) || S.value.EXPORT
+  // 旧快照可能停留在已移除的擦除步骤（step=5），统一收敛到新流程的最大步骤。
+  const restoredStep = Number(state.step) || S.value.EXPORT
+  step.value = Math.min(Math.max(restoredStep, S.value.UPLOAD), S.value.EXPORT)
   currentView.value = 'workspace_review'
   await nextTick()
   setTimeout(() => { reviewStageRef.value?.triggerTypeset?.() }, 400)
@@ -143,9 +144,9 @@ const doReset = async () => {
 
 // ── 分割流水线 ──────────────────────────────────────────
 const {
-  eraseEnabled, eraseLoading, eraseImages, eraseDone,
   ocrLoading, ocrPages, ocrDone, notePreview, autoProcessing,
-  startProcess, runAutoProcess, doErase, doOcr, doSplit, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
+  startProcess, runAutoProcess, doOcr, doSplit, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
+  generateSelectedAnswers,
 } = useSplitPipeline(pushToast, currentView, step, S, uploadReady, splitting, splitCompleted, uploadMode, selectedLlmOption, questions, selectedIds, pendingFiles, typesetMath)
 
 const reviewStageRef = ref(null)
@@ -153,6 +154,8 @@ const restoringWorkspaceState = ref(true)
 const importDialogOpen = ref(false)
 const importTargetProjectId = ref(null)
 const importSaving = ref(false)
+const autoGenerateAnswers = ref(false)
+const generatingAnswers = ref(false)
 const noteSaveDialogOpen = ref(false)
 const noteTargetProjectId = ref(null)
 const noteSaving = ref(false)
@@ -160,8 +163,6 @@ const updateSelectedLlmOption = (value) => {
   selectedLlmOptionId.value = value || ''
 }
 const hasReviewContent = computed(() => {
-  if (eraseLoading.value) return true
-  if (eraseDone.value) return true
   if (ocrLoading.value) return true
   if (ocrDone.value) return true
   if (splitting.value) return true
@@ -182,11 +183,10 @@ const handleLoadRecord = (qs, record) => {
 }
 
 /**
- * 从核对页返回上传页，并重置擦除/OCR/分割结果。
+ * 从核对页返回上传页，并重置识别/分割结果。
  */
 const handleBack = async () => {
   await doReset()
-  eraseImages.value = []; eraseDone.value = false
   ocrPages.value = []; ocrDone.value = false
   notePreview.value = null
   noteSaveDialogOpen.value = false
@@ -206,6 +206,7 @@ const openImportDialog = () => {
     return
   }
   importTargetProjectId.value = activeQuestionProjectId.value || questionProjects.value[0]?.id || null
+  autoGenerateAnswers.value = false
   importDialogOpen.value = true
 }
 
@@ -245,12 +246,18 @@ const confirmImportToProject = async () => {
   if (!importTargetProjectId.value || importSaving.value) return
   importSaving.value = true
   try {
+    if (autoGenerateAnswers.value) {
+      generatingAnswers.value = true
+      const generated = await generateSelectedAnswers()
+      if (!generated) return
+    }
     const saved = await doSaveToDb(importTargetProjectId.value)
     if (saved) {
       setActiveProject(importTargetProjectId.value, 'question')
       importDialogOpen.value = false
     }
   } finally {
+    generatingAnswers.value = false
     importSaving.value = false
   }
 }
@@ -308,12 +315,6 @@ watch(
   { deep: true },
 )
 
-watch(uploadMode, (mode) => {
-  if (mode === 'note') {
-    eraseEnabled.value = false
-  }
-})
-
 watch(notePreview, (value) => {
   if (uploadMode.value === 'note' && value) {
     openNoteSaveDialog()
@@ -367,41 +368,32 @@ onBeforeUnmount(() => {
             @go-workspace="currentView = splitCompleted ? 'workspace_review' : 'workspace'" />
         </template>
 
-        <UploadStage :upload-mode="uploadMode" :workflow-mode="workflowMode" :erase-enabled="eraseEnabled" :status-loading="statusLoading"
+        <UploadStage :upload-mode="uploadMode" :workflow-mode="workflowMode" :status-loading="statusLoading"
           :status-error="statusError" :status-pills="statusPills" :model-options-data="modelOptionsData"
           :selected-llm-option-id="selectedLlmOptionId" :has-configured-model="hasConfiguredModel"
           :splitting="splitting || autoProcessing" :split-completed="splitCompleted" :pending-files="pendingFiles"
           :file-progress="fileProgress" :waiting-keys="waitingKeys" :upload-busy="uploadBusy"
           :upload-ready="uploadReady" :split-enabled="splitEnabled" @update:upload-mode="(v) => uploadMode = v"
           @update:workflow-mode="(v) => workflowMode = v"
-          @update:erase-enabled="(v) => eraseEnabled = v"
           @update:selected-llm-option-id="updateSelectedLlmOption" @upload="enqueueUpload"
           @remove-file="removePendingFile" @split="handleStartProcess" />
       </ContentPanel>
 
       <!-- 第二页：解析结果核对 -->
       <ContentPanel v-else-if="currentView === 'workspace_review'" key="review"
-        :title="eraseLoading
-          ? '正在擦除...'
-          : eraseDone && !ocrLoading && !ocrDone
-            ? '擦除预览'
-            : splitting
-              ? (uploadMode === 'note' ? '正在整理笔记...' : '正在分割...')
-              : uploadMode === 'note' && notePreview
-                ? '笔记整理结果'
-                : ocrDone && !splitCompleted
-                  ? 'OCR 预览'
-                  : '题目数据核对'"
+        :title="splitting
+          ? (uploadMode === 'note' ? '正在整理笔记...' : '正在分割...')
+          : uploadMode === 'note' && notePreview
+            ? '笔记整理结果'
+            : ocrDone && !splitCompleted
+              ? '识别预览'
+              : '题目数据核对'"
         :steps="workspaceSteps" :current-step="step - 1">
         <template #toolbar>
           <BaseToolbarButton icon="fa-arrow-left-long" @click="handleBack">
             返回
           </BaseToolbarButton>
-          <template v-if="eraseDone && !ocrLoading && !ocrDone">
-            <BaseToolbarButton icon="fa-arrows-rotate" @click="doErase">重新擦除</BaseToolbarButton>
-            <BaseToolbarButton icon="fa-check" variant="primary" @click="doOcr">确认，开始 OCR</BaseToolbarButton>
-          </template>
-          <template v-else-if="ocrDone && !splitCompleted && !splitting">
+          <template v-if="ocrDone && !splitCompleted && !splitting">
             <BaseToolbarButton icon="fa-arrows-rotate" @click="doOcr">重新识别</BaseToolbarButton>
             <BaseToolbarButton icon="fa-check" variant="primary" @click="doSplit">{{ uploadMode === 'note' ? '确认并整理' : '确认并分割' }}</BaseToolbarButton>
           </template>
@@ -412,10 +404,10 @@ onBeforeUnmount(() => {
           </template>
         </template>
 
-        <ReviewStage ref="reviewStageRef" :erase-loading="eraseLoading" :erase-done="eraseDone"
-          :erase-images="eraseImages" :ocr-loading="ocrLoading" :ocr-done="ocrDone" :ocr-pages="ocrPages"
+        <ReviewStage ref="reviewStageRef"
+          :ocr-loading="ocrLoading" :ocr-done="ocrDone" :ocr-pages="ocrPages"
           :upload-mode="uploadMode" :splitting="splitting" :split-completed="splitCompleted" :questions="questions" :selected-ids="selectedIds"
-          :note-preview="notePreview"
+          :note-preview="notePreview" :model-name="selectedLlmOption?.model_name || ''"
           :preview-url="pendingPreviewUrls[0]" @toggle-select="toggleQuestion" @select-all="selectAll"
           @deselect-all="deselectAll" @open-image="openModal" @reorder="reorderQuestions" />
       </ContentPanel>
@@ -443,6 +435,11 @@ onBeforeUnmount(() => {
             <i v-if="String(importTargetProjectId) === String(project.id)" class="fa-solid fa-check text-xs"></i>
           </button>
         </div>
+        <div class="rounded-lg border border-slate-200/70 bg-white/50 px-3 py-2.5 dark:border-white/[0.08] dark:bg-white/[0.03]">
+          <BaseCheckbox v-model="autoGenerateAnswers" label="自动生成标准答案解析（AI）"
+            description="导入前先用当前模型为选中的题目生成标准答案与解析，取消勾选则直接导入。"
+            :disabled="importSaving" />
+        </div>
       </div>
       <template #footer>
         <BaseButton variant="secondary" size="sm" :disabled="importSaving" @click="closeImportDialog">
@@ -450,7 +447,7 @@ onBeforeUnmount(() => {
         </BaseButton>
         <BaseButton variant="primary" size="sm" :disabled="importSaving || !importTargetProjectId"
           @click="confirmImportToProject">
-          {{ importSaving ? '导入中...' : '确认导入' }}
+          {{ generatingAnswers ? '生成中…' : importSaving ? '导入中...' : '确认导入' }}
         </BaseButton>
       </template>
     </BaseModal>

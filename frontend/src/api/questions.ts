@@ -22,6 +22,29 @@ type AiAnalysisOptions = {
   modelName?: string
 }
 
+/** 生成标准答案解析时提交的单题字段，顺序与响应一一对应。 */
+export type GeneratedAnswerQuestion = {
+  uid?: string | null
+  id?: Id | null
+  question_id?: string | number | null
+  question_type?: string
+  content_blocks?: unknown[]
+  options?: unknown[]
+}
+
+export type GeneratedAnswer = {
+  uid?: string | null
+  id?: Id | null
+  answer?: string
+  reasoning?: string
+  confidence?: number
+}
+
+type GenerateAnswersResponse = {
+  success: true
+  results?: GeneratedAnswer[]
+}
+
 type ExportFromDbResponse = {
   success: true
   output_path?: string
@@ -173,5 +196,28 @@ export async function saveQuestionAnswer(questionId: Id, answer: string) {
     body: JSON.stringify({ answer }),
   })
   return assertJsonSuccess(resp, '保存答案失败')
+}
+
+/**
+ * 调用后端批量生成标准答案与解析。
+ * 返回顺序与请求的 questions 一致，失败时抛出带 status 的错误。
+ */
+export async function generateAnswers(
+  questions: GeneratedAnswerQuestion[],
+  { providerSource, providerId, modelProvider, modelName }: AiAnalysisOptions = {},
+): Promise<GeneratedAnswer[]> {
+  const body: Record<string, unknown> = { questions }
+  if (modelProvider) body.model_provider = modelProvider
+  if (modelName) body.model_name = modelName
+  if (providerSource) body.provider_source = providerSource
+  if (providerId) body.provider_id = providerId
+
+  const resp = await fetch('/api/generate-answers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const data = await assertJsonSuccess<GenerateAnswersResponse>(resp, '生成标准答案失败')
+  return data.results || []
 }
 

@@ -1,14 +1,14 @@
 <script setup lang="ts">
 /**
  * SettingsView.vue
- * 设置页面，包含用户资料、免费额度、外观主题、个人 API 和系统 API 配置。
+ * 设置页面，包含用户资料、免费点数、外观主题、个人 API 和系统 API 配置。
  */
 import { computed, ref, onMounted, watch, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts/core'
 import { TooltipComponent, LegendComponent, GridComponent } from 'echarts/components'
 import { BarChart } from 'echarts/charts'
 import { CanvasRenderer } from 'echarts/renderers'
-import { fetchAppConfig, updateAppConfig, fetchAdminSystemConfig, updateAdminSystemConfig, updateProfile, uploadProfileAvatar, deleteProfileAvatar } from '@/api/index'
+import { fetchAppConfig, updateAppConfig, fetchAdminSystemConfig, updateAdminSystemConfig, updateProfile, uploadProfileAvatar, deleteProfileAvatar, fetchAdminUsageSummary } from '@/api/index'
 import { genId } from '@/utils/index'
 import { useAuth } from '@/composables/useAuth'
 import { useToast } from '@/composables/useToast'
@@ -25,7 +25,6 @@ import BaseModal from '@/components/base/BaseModal.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import providerOpenaiIcon from '@/assets/provider-openai.svg'
 import providerAnthropicIcon from '@/assets/provider-anthropic.svg'
-import providerPaddleocrIcon from '@/assets/provider-paddleocr.svg'
 
 echarts.use([TooltipComponent, LegendComponent, GridComponent, BarChart, CanvasRenderer])
 
@@ -52,9 +51,9 @@ const currentActiveSystemLlmProviderId = computed(() => {
 
 const quotaResetText = computed(() => {
   const resetAt = quota.value?.reset_at
-  if (!resetAt) return '每日凌晨自动重置免费体验次数'
+  if (!resetAt) return '每日凌晨自动重置免费体验点数'
   const date = new Date(resetAt)
-  if (Number.isNaN(date.getTime())) return '每日凌晨自动重置免费体验次数'
+  if (Number.isNaN(date.getTime())) return '每日凌晨自动重置免费体验点数'
   return `下次重置时间：${date.toLocaleString('zh-CN', { hour12: false })}`
 })
 
@@ -69,9 +68,37 @@ const quotaDailyChartRef = ref(null)
 let quotaDailyBarChart = null
 let quotaChartResizeObserver = null
 
+// 今日模型消耗：后端按点数计费，cost_yuan 为实际费用。
+const quotaTodayUsage = computed(() => quota.value?.today_usage || null)
+const formatTokens = (value) => Number(value || 0).toLocaleString('zh-CN')
+const formatYuan = (value) => `¥${Number(value || 0).toFixed(4)}`
+const formatPoints = (value) => `${Number(value || 0)} 点`
+
+// 管理员可见的全局消耗统计；请求失败时仅展示占位，不阻塞页面。
+const isAdmin = computed(() => !!currentUser.value?.is_admin)
+const adminUsageSummary = ref(null)
+const adminUsageLoading = ref(false)
+const adminUsageDays = computed(() => adminUsageSummary.value?.days || 14)
+const adminUsageTotal = computed(() => adminUsageSummary.value?.total || null)
+const adminUsageUsersCount = computed(() => adminUsageSummary.value?.users_count ?? null)
+const adminUsageByModelTop = computed(() => (adminUsageSummary.value?.by_model || []).slice(0, 5))
+
+const loadAdminUsageSummary = async () => {
+  if (!isAdmin.value || adminUsageLoading.value) return
+  adminUsageLoading.value = true
+  try {
+    adminUsageSummary.value = await fetchAdminUsageSummary(14)
+  } catch {
+    // 统计接口不可用时静默降级为「暂无数据」
+    adminUsageSummary.value = null
+  } finally {
+    adminUsageLoading.value = false
+  }
+}
+
 const getQuotaActionColor = (actionType) => {
   if (actionType === 'chat') return '#60a5fa'
-  if (actionType === 'erase') return '#f59e0b'
+  if (actionType === 'ocr' || actionType === 'vision') return '#f59e0b'
   if (actionType === 'split') return '#34d399'
   if (actionType === 'note') return '#a78bfa'
   return '#94a3b8'
@@ -84,10 +111,10 @@ const refreshQuotaSectionData = async (silent = true) => {
     await refreshCurrentUser()
     await nextTick()
     renderQuotaCharts()
-    if (!silent) pushToast('success', '额度记录已刷新')
+    if (!silent) pushToast('success', '点数记录已刷新')
   } catch (e) {
     if (!silent) {
-      pushToast('error', e instanceof Error ? e.message : '刷新额度数据失败')
+      pushToast('error', e instanceof Error ? e.message : '刷新点数数据失败')
     }
   } finally {
     quotaRefreshing.value = false
@@ -113,11 +140,11 @@ const renderQuotaCharts = async () => {
   const chartDays = quotaDailyChart.value.days || []
   const xAxisData = chartDays.map((item) => item.label)
   const hasAnyUsage = chartDays.some((item) => item.total > 0)
-  const seriesMeta = [
-    { key: 'chat', label: 'AI 对话' },
-    { key: 'erase', label: '擦除笔记' },
-    { key: 'split', label: '分割题目' },
-  ]
+  // 消耗分类由后端 daily_chart.actions 下发，前端不再固定擦除等旧动作；旧响应缺少 actions 时退回基础两项。
+  const chartActions = quotaDailyChart.value.actions?.length
+    ? quotaDailyChart.value.actions
+    : [{ key: 'chat', label: 'AI 对话' }, { key: 'split', label: '分割题目' }]
+  const seriesMeta = chartActions.map((action) => ({ key: action.key, label: action.label }))
   const getStackedBarData = (seriesKey) => chartDays.map((day) => {
     const activeKeys = seriesMeta
       .map((item) => item.key)
@@ -153,14 +180,14 @@ const renderQuotaCharts = async () => {
         if (!items?.length) return '暂无数据'
         const day = chartDays[items[0].dataIndex]
         const lines = [`${day?.date || items[0].axisValue}`]
-        if (day?.total) lines.push(`总消耗：${day.total}`)
+        if (day?.total) lines.push(`总点数：${day.total}`)
         items.forEach((item) => {
           const rawValue = day?.[item.seriesId] || 0
           if (!rawValue) return
           const pct = day?.total ? ((rawValue / day.total) * 100).toFixed(1) : '0.0'
           lines.push(`${item.marker}${item.seriesName}：${rawValue} (${pct}%)`)
         })
-        if (!day?.total) lines.push('暂无消耗')
+        if (!day?.total) lines.push('暂无点数消耗')
         return lines.join('<br/>')
       },
     },
@@ -182,7 +209,7 @@ const renderQuotaCharts = async () => {
             left: 'center',
             top: 'middle',
             style: {
-              text: '最近 14 天暂无额度消耗',
+              text: '最近 14 天暂无点数消耗',
               fill: isDark.value ? '#64748b' : '#94a3b8',
               fontSize: 14,
               fontWeight: 500,
@@ -227,15 +254,15 @@ const isApiSection = computed(() => props.section === 'api')
 const isAppearanceSection = computed(() => props.section === 'appearance')
 const settingsPageTitle = computed(() => {
   if (isApiSection.value) return 'API 设置'
-  if (isQuotaSection.value) return '免费额度'
+  if (isQuotaSection.value) return '免费点数'
   if (isSystemProvidersSection.value) return '平台托管'
   if (isAppearanceSection.value) return '外观设置'
   return '用户资料设置'
 })
 const settingsPageDescription = computed(() => {
   if (isApiSection.value) return '集中管理 AI 与 OCR provider 的接口配置。'
-  if (isQuotaSection.value) return '查看系统托管 AI / OCR 服务的免费体验额度与每日重置时间。'
-  if (isSystemProvidersSection.value) return '配置用于免费体验额度消耗的系统级 AI / OCR Provider。'
+  if (isQuotaSection.value) return '查看平台托管 AI 服务的免费体验点数与每日重置时间。'
+  if (isSystemProvidersSection.value) return '配置用于免费体验点数消耗的系统级 AI Provider。'
   if (isAppearanceSection.value) return '切换明暗模式和主题强调色，界面会立即应用。'
   return '配置显示名称、昵称与头像，侧边栏会立即同步展示。'
 })
@@ -585,33 +612,18 @@ const makeAnthropicProvider = (data = {}) => ({
   api_key_hint: data.api_key_hint || '',
 })
 
-const makePaddleOCRProvider = (data = {}) => ({
-  id: data.id || genId(),
-  name: data.name || '',
-  api_key: data.api_key || '',
-  base_url: data.base_url || data.api_url || '',
-  model_name: data.model_name || data.model || '',
-  use_doc_orientation: data.use_doc_orientation || false,
-  use_doc_unwarping: data.use_doc_unwarping || false,
-  use_chart_recognition: data.use_chart_recognition || false,
-  api_key_set: data.api_key_set || data.api_token_set || false,
-  api_key_hint: data.api_key_hint || data.api_token_hint || '',
-})
-
 const openaiProviders = ref([])
 const anthropicProviders = ref([])
-const paddleocrProviders = ref([])
 
 // 当前激活的 provider ID（每类只能激活一个）
 const activeOpenaiId = ref(null)
 const activeAnthropicId = ref(null)
-const activePaddleocrId = ref(null)
 
 /**
  * 切换个人 Provider 的启用状态；同类型下只有一个可激活。
  */
 const toggleActive = (type, id) => {
-  const refMap = { openai: activeOpenaiId, anthropic: activeAnthropicId, paddleocr: activePaddleocrId }
+  const refMap = { openai: activeOpenaiId, anthropic: activeAnthropicId }
   const target = refMap[type]
   const isActivating = target.value !== id
   target.value = isActivating ? id : null
@@ -629,10 +641,8 @@ const toggleActive = (type, id) => {
 
 const systemOpenaiProviders = ref([])
 const systemAnthropicProviders = ref([])
-const systemPaddleocrProviders = ref([])
 const systemActiveOpenaiId = ref(null)
 const systemActiveAnthropicId = ref(null)
-const systemActivePaddleocrId = ref(null)
 const systemLoading = ref(false)
 const systemSaving = ref(false)
 const systemConfigLoaded = ref(false)
@@ -641,7 +651,7 @@ const systemConfigLoaded = ref(false)
  * 切换系统级 Provider 的启用状态，并立即保存到后端。
  */
 const toggleSystemActive = async (type, id) => {
-  const refMap = { openai: systemActiveOpenaiId, anthropic: systemActiveAnthropicId, paddleocr: systemActivePaddleocrId }
+  const refMap = { openai: systemActiveOpenaiId, anthropic: systemActiveAnthropicId }
   const target = refMap[type]
   const isActivating = target.value !== id
   target.value = isActivating ? id : null
@@ -690,15 +700,6 @@ const loadConfig = async () => {
       anthropicProviders.value = []
     }
     activeAnthropicId.value = cfg.active_anthropic_id ?? null
-
-    if (cfg.paddleocr_providers && cfg.paddleocr_providers.length > 0) {
-      paddleocrProviders.value = cfg.paddleocr_providers.map(p => makePaddleOCRProvider(p))
-    } else if (cfg.paddleocr) {
-      paddleocrProviders.value = [makePaddleOCRProvider({ name: 'Default', ...cfg.paddleocr })]
-    } else {
-      paddleocrProviders.value = []
-    }
-    activePaddleocrId.value = cfg.active_paddleocr_id ?? null
   } catch (e) {
     pushToast('error', '加载配置失败: ' + (e instanceof Error ? e.message : String(e)))
   } finally {
@@ -728,15 +729,8 @@ const saveConfig = async () => {
       return item
     })
 
-    payload.paddleocr_providers = paddleocrProviders.value.map(p => {
-      const item = { id: p.id, name: p.name, api_url: p.base_url, model: p.model_name, use_doc_orientation: p.use_doc_orientation, use_doc_unwarping: p.use_doc_unwarping, use_chart_recognition: p.use_chart_recognition }
-      if (p.api_key) item.api_token = p.api_key
-      return item
-    })
-
     payload.active_openai_id = activeOpenaiId.value
     payload.active_anthropic_id = activeAnthropicId.value
-    payload.active_paddleocr_id = activePaddleocrId.value
 
     await updateAppConfig(payload)
     doFetchStatus()
@@ -757,10 +751,8 @@ const loadSystemConfig = async () => {
     const cfg = await fetchAdminSystemConfig()
     systemOpenaiProviders.value = (cfg.openai_providers || []).map(p => makeOpenAIProvider(p))
     systemAnthropicProviders.value = (cfg.anthropic_providers || []).map(p => makeAnthropicProvider(p))
-    systemPaddleocrProviders.value = (cfg.paddleocr_providers || []).map(p => makePaddleOCRProvider(p))
     systemActiveOpenaiId.value = cfg.active_openai_id ?? null
     systemActiveAnthropicId.value = cfg.active_anthropic_id ?? null
-    systemActivePaddleocrId.value = cfg.active_paddleocr_id ?? null
     systemConfigLoaded.value = true
   } catch (e) {
     pushToast('error', '加载系统托管配置失败: ' + (e instanceof Error ? e.message : String(e)))
@@ -787,14 +779,8 @@ const saveSystemConfig = async () => {
       if (p.api_key) item.api_key = p.api_key
       return item
     })
-    payload.paddleocr_providers = systemPaddleocrProviders.value.map(p => {
-      const item = { id: p.id, name: p.name, api_url: p.base_url, model: p.model_name, use_doc_orientation: p.use_doc_orientation, use_doc_unwarping: p.use_doc_unwarping, use_chart_recognition: p.use_chart_recognition }
-      if (p.api_key) item.api_token = p.api_key
-      return item
-    })
     payload.active_openai_id = systemActiveOpenaiId.value
     payload.active_anthropic_id = systemActiveAnthropicId.value
-    payload.active_paddleocr_id = systemActivePaddleocrId.value
 
     await updateAdminSystemConfig(payload)
     doFetchStatus()
@@ -811,7 +797,7 @@ let autoSaveTimer = null
 const configLoaded = ref(false)
 
 watch(
-  [openaiProviders, anthropicProviders, paddleocrProviders, activeOpenaiId, activeAnthropicId, activePaddleocrId],
+  [openaiProviders, anthropicProviders, activeOpenaiId, activeAnthropicId],
   () => {
     if (!configLoaded.value) return
     clearTimeout(autoSaveTimer)
@@ -821,8 +807,8 @@ watch(
 )
 
 const removeProvider = async (type, idx) => {
-  const listMap = { openai: openaiProviders, anthropic: anthropicProviders, paddleocr: paddleocrProviders }
-  const activeMap = { openai: activeOpenaiId, anthropic: activeAnthropicId, paddleocr: activePaddleocrId }
+  const listMap = { openai: openaiProviders, anthropic: anthropicProviders }
+  const activeMap = { openai: activeOpenaiId, anthropic: activeAnthropicId }
   const list = listMap[type]
   if (list.value[idx]?.id === activeMap[type].value) activeMap[type].value = null
   list.value.splice(idx, 1)
@@ -834,8 +820,8 @@ const removeProvider = async (type, idx) => {
 }
 
 const removeSystemProvider = async (type, idx) => {
-  const listMap = { openai: systemOpenaiProviders, anthropic: systemAnthropicProviders, paddleocr: systemPaddleocrProviders }
-  const activeMap = { openai: systemActiveOpenaiId, anthropic: systemActiveAnthropicId, paddleocr: systemActivePaddleocrId }
+  const listMap = { openai: systemOpenaiProviders, anthropic: systemAnthropicProviders }
+  const activeMap = { openai: systemActiveOpenaiId, anthropic: systemActiveAnthropicId }
   const list = listMap[type]
   if (list.value[idx]?.id === activeMap[type].value) activeMap[type].value = null
   list.value.splice(idx, 1)
@@ -870,15 +856,11 @@ const openEditDialog = (type, provider, idx) => {
  */
 const onDialogConfirm = async (formData) => {
   if (dialogEditIndex.value >= 0) {
-    const listMap = { openai: openaiProviders, anthropic: anthropicProviders, paddleocr: paddleocrProviders }
+    const listMap = { openai: openaiProviders, anthropic: anthropicProviders }
     const list = listMap[dialogType.value]
     const existing = list.value[dialogEditIndex.value]
     if (existing) {
       Object.assign(existing, formData)
-      if (dialogType.value === 'paddleocr') {
-        existing.base_url = formData.base_url
-        existing.model_name = formData.model_name
-      }
     }
   } else {
     if (dialogType.value === 'openai') {
@@ -889,10 +871,6 @@ const onDialogConfirm = async (formData) => {
       const p = makeAnthropicProvider(formData)
       anthropicProviders.value.push(p)
       if (anthropicProviders.value.length === 1) activeAnthropicId.value = p.id
-    } else {
-      const p = makePaddleOCRProvider({ name: formData.name, api_key: formData.api_key, api_url: formData.base_url, model: formData.model_name, use_doc_orientation: formData.use_doc_orientation, use_doc_unwarping: formData.use_doc_unwarping, use_chart_recognition: formData.use_chart_recognition })
-      paddleocrProviders.value.push(p)
-      if (paddleocrProviders.value.length === 1) activePaddleocrId.value = p.id
     }
   }
   const isEdit = dialogEditIndex.value >= 0
@@ -929,15 +907,11 @@ const openSystemEditDialog = (type, provider, idx) => {
  */
 const onSystemDialogConfirm = async (formData) => {
   if (systemDialogEditIndex.value >= 0) {
-    const listMap = { openai: systemOpenaiProviders, anthropic: systemAnthropicProviders, paddleocr: systemPaddleocrProviders }
+    const listMap = { openai: systemOpenaiProviders, anthropic: systemAnthropicProviders }
     const list = listMap[systemDialogType.value]
     const existing = list.value[systemDialogEditIndex.value]
     if (existing) {
       Object.assign(existing, formData)
-      if (systemDialogType.value === 'paddleocr') {
-        existing.base_url = formData.base_url
-        existing.model_name = formData.model_name
-      }
     }
   } else {
     if (systemDialogType.value === 'openai') {
@@ -948,10 +922,6 @@ const onSystemDialogConfirm = async (formData) => {
       const p = makeAnthropicProvider(formData)
       systemAnthropicProviders.value.push(p)
       if (systemAnthropicProviders.value.length === 1) systemActiveAnthropicId.value = p.id
-    } else {
-      const p = makePaddleOCRProvider({ name: formData.name, api_key: formData.api_key, api_url: formData.base_url, model: formData.model_name, use_doc_orientation: formData.use_doc_orientation, use_doc_unwarping: formData.use_doc_unwarping, use_chart_recognition: formData.use_chart_recognition })
-      systemPaddleocrProviders.value.push(p)
-      if (systemPaddleocrProviders.value.length === 1) systemActivePaddleocrId.value = p.id
     }
   }
 
@@ -967,6 +937,7 @@ onMounted(async () => {
   await loadConfig()
   if (isQuotaSection.value) {
     await refreshQuotaSectionData()
+    if (isAdmin.value) await loadAdminUsageSummary()
   }
   if (currentUser.value?.is_admin && isSystemProvidersSection.value) {
     await loadSystemConfig()
@@ -986,7 +957,17 @@ watch(
 watch(
   isQuotaSection,
   (active) => {
-    if (active) refreshQuotaSectionData()
+    if (active) {
+      refreshQuotaSectionData()
+      if (isAdmin.value) loadAdminUsageSummary()
+    }
+  },
+)
+
+watch(
+  isAdmin,
+  (admin) => {
+    if (admin && isQuotaSection.value) loadAdminUsageSummary()
   },
 )
 
@@ -1128,7 +1109,7 @@ watch(
             <div class="mb-4 flex items-start justify-between gap-4">
               <div>
                 <div class="flex flex-wrap items-center gap-3">
-                  <h2 class="text-lg font-bold text-slate-900 dark:text-[#f7f8f8]">免费体验额度</h2>
+                  <h2 class="text-lg font-bold text-slate-900 dark:text-[#f7f8f8]">免费体验点数</h2>
                   <button
                     type="button"
                     class="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-white/70 px-3 py-1 text-xs font-medium text-slate-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-slate-300 dark:hover:bg-white/[0.08]"
@@ -1139,22 +1120,21 @@ watch(
                     {{ quotaRefreshing ? '刷新中' : '刷新记录' }}
                   </button>
                 </div>
-                <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">使用平台托管的 AI / OCR 服务时会消耗每日免费次数；使用您自己的已配置
+                <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">使用平台托管的 AI 服务时按实际用量扣减每日免费点数；使用您自己的已配置
                   Provider
                   不会扣减。</p>
               </div>
               <div
                 class="rounded-full border border-slate-200 bg-gray-50 px-3 py-1 text-xs font-bold text-slate-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-slate-400">
-                {{ quota?.remaining ?? '--' }} / {{ quota?.daily_free_quota ?? '--' }}
+                {{ quota?.remaining ?? '--' }} / {{ quota?.daily_free_quota ?? '--' }} 点
               </div>
             </div>
 
             <div class="grid gap-4 md:grid-cols-2">
               <div
                 class="rounded-xl border border-gray-100 bg-white/50 p-4 dark:border-white/[0.04] dark:bg-white/[0.02]">
-                <p class="text-xs font-medium text-slate-500 dark:text-slate-400">每日额度</p>
-                <p class="mt-2 text-2xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ quota?.daily_free_quota ?? '--'
-                  }}</p>
+                <p class="text-xs font-medium text-slate-500 dark:text-slate-400">每日点数</p>
+                <p class="mt-2 text-2xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ quota?.daily_free_quota ?? '--' }} 点</p>
                 <div class="mt-4 h-2.5 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-white/[0.06]">
                   <div
                     class="h-full transition-all duration-500 ease-out"
@@ -1166,7 +1146,7 @@ watch(
               <div
                 class="rounded-xl border border-[rgb(var(--accent-rgb)/0.24)] bg-[rgb(var(--accent-rgb)/0.10)] p-4 dark:border-[rgb(var(--accent-rgb)/0.28)] dark:bg-[rgb(var(--accent-rgb)/0.12)]">
                 <p class="text-xs font-medium text-slate-500 dark:text-slate-400">今日剩余</p>
-                <p class="mt-2 text-2xl font-bold accent-text">{{ quota?.remaining ?? '--' }}</p>
+                <p class="mt-2 text-2xl font-bold accent-text">{{ quota?.remaining ?? '--' }} 点</p>
               </div>
             </div>
 
@@ -1180,13 +1160,102 @@ watch(
                 <div class="mb-4 flex items-center justify-between gap-3">
                   <div>
                     <h3 class="text-sm font-semibold text-slate-900 dark:text-[#f7f8f8]">
-                      <i class="fa-solid fa-chart-column mr-2 text-[rgb(var(--accent-rgb))]"></i>
-                      每日额度占比
+                      <i class="fa-solid fa-coins mr-2 text-[rgb(var(--accent-rgb))]"></i>
+                      今日模型消耗
                     </h3>
-                    <p class="mt-1 text-xs text-slate-500 dark:text-slate-500">近 {{ quotaDailyChart.range_days }} 天每天一根柱，显示 AI 对话、擦除和分割的消耗占比。</p>
+                    <p class="mt-1 text-xs text-slate-500 dark:text-slate-500">今日视觉识别、题目分割等操作的实际用量与扣点。</p>
+                  </div>
+                  <span v-if="quotaTodayUsage" class="text-xs text-slate-500 dark:text-slate-400">共 {{ quotaTodayUsage.requests ?? 0 }} 次请求</span>
+                </div>
+                <div class="grid gap-3 sm:grid-cols-3">
+                  <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                    <p class="text-xs font-medium text-slate-500 dark:text-slate-400">今日 Tokens</p>
+                    <p class="mt-1.5 text-xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ formatTokens(quotaTodayUsage?.total_tokens) }}</p>
+                  </div>
+                  <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                    <p class="text-xs font-medium text-slate-500 dark:text-slate-400">今日费用</p>
+                    <p class="mt-1.5 text-xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ formatYuan(quotaTodayUsage?.cost_yuan) }}</p>
+                  </div>
+                  <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                    <p class="text-xs font-medium text-slate-500 dark:text-slate-400">今日扣点</p>
+                    <p class="mt-1.5 text-xl font-bold accent-text">{{ formatPoints(quotaTodayUsage?.points) }}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-6">
+              <div class="rounded-xl border border-gray-100 bg-white/50 p-4 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                <div class="mb-4 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 class="text-sm font-semibold text-slate-900 dark:text-[#f7f8f8]">
+                      <i class="fa-solid fa-chart-column mr-2 text-[rgb(var(--accent-rgb))]"></i>
+                      每日点数占比
+                    </h3>
+                    <p class="mt-1 text-xs text-slate-500 dark:text-slate-500">近 {{ quotaDailyChart.range_days }} 天每天一根柱，显示各类操作的扣点占比。</p>
                   </div>
                 </div>
                 <div ref="quotaDailyChartRef" class="h-[320px] w-full"></div>
+              </div>
+            </div>
+
+            <div v-if="currentUser?.is_admin" class="mt-6">
+              <div class="rounded-xl border border-gray-100 bg-white/50 p-4 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                <div class="mb-4 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 class="text-sm font-semibold text-slate-900 dark:text-[#f7f8f8]">
+                      <i class="fa-solid fa-users-viewfinder mr-2 text-[rgb(var(--accent-rgb))]"></i>
+                      全局消耗统计
+                    </h3>
+                    <p class="mt-1 text-xs text-slate-500 dark:text-slate-500">近 {{ adminUsageDays }} 天全平台用量，仅管理员可见。</p>
+                  </div>
+                  <span v-if="adminUsageLoading" class="text-xs text-slate-500 dark:text-slate-400">
+                    <i class="fa-solid fa-circle-notch fa-spin mr-1"></i>加载中
+                  </span>
+                </div>
+                <template v-if="adminUsageTotal">
+                  <div class="grid gap-3 sm:grid-cols-4">
+                    <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                      <p class="text-xs font-medium text-slate-500 dark:text-slate-400">总 Tokens</p>
+                      <p class="mt-1.5 text-xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ formatTokens(adminUsageTotal.total_tokens) }}</p>
+                    </div>
+                    <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                      <p class="text-xs font-medium text-slate-500 dark:text-slate-400">总费用</p>
+                      <p class="mt-1.5 text-xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ formatYuan(adminUsageTotal.cost_yuan) }}</p>
+                    </div>
+                    <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                      <p class="text-xs font-medium text-slate-500 dark:text-slate-400">总点数</p>
+                      <p class="mt-1.5 text-xl font-bold accent-text">{{ formatPoints(adminUsageTotal.points) }}</p>
+                    </div>
+                    <div class="rounded-lg border border-gray-100 bg-white/60 p-3 dark:border-white/[0.04] dark:bg-white/[0.02]">
+                      <p class="text-xs font-medium text-slate-500 dark:text-slate-400">用户数</p>
+                      <p class="mt-1.5 text-xl font-bold text-slate-900 dark:text-[#f7f8f8]">{{ adminUsageUsersCount ?? '--' }}</p>
+                    </div>
+                  </div>
+                  <div v-if="adminUsageByModelTop.length" class="mt-4 overflow-x-auto">
+                    <table class="w-full text-left text-xs">
+                      <thead class="text-slate-400 dark:text-slate-500">
+                        <tr>
+                          <th class="py-2 pr-3 font-medium">模型</th>
+                          <th class="py-2 pr-3 font-medium">请求</th>
+                          <th class="py-2 pr-3 font-medium">Tokens</th>
+                          <th class="py-2 pr-3 font-medium">费用</th>
+                          <th class="py-2 font-medium">点数</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="row in adminUsageByModelTop" :key="row.model_name" class="border-t border-gray-100 dark:border-white/[0.06]">
+                          <td class="py-2 pr-3 font-medium text-slate-700 dark:text-slate-200">{{ row.model_name }}</td>
+                          <td class="py-2 pr-3 text-slate-500 dark:text-slate-400">{{ row.requests ?? 0 }}</td>
+                          <td class="py-2 pr-3 text-slate-500 dark:text-slate-400">{{ formatTokens(row.total_tokens) }}</td>
+                          <td class="py-2 pr-3 text-slate-500 dark:text-slate-400">{{ formatYuan(row.cost_yuan) }}</td>
+                          <td class="py-2 text-slate-500 dark:text-slate-400">{{ row.points ?? 0 }} 点</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </template>
+                <p v-else class="py-6 text-center text-xs text-slate-400 dark:text-slate-500">暂无数据</p>
               </div>
             </div>
           </template>
@@ -1196,7 +1265,7 @@ watch(
             <div class="mb-5 flex items-start justify-between gap-3">
               <div>
                 <h2 class="text-lg font-bold text-slate-900 dark:text-[#f7f8f8]">平台托管服务配置</h2>
-                <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">配置用于免费体验额度消耗的系统级 AI / OCR Provider。</p>
+                <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">配置用于免费体验点数消耗的系统级 AI Provider。</p>
               </div>
               <div v-if="systemSaving" class="text-xs text-slate-500 dark:text-slate-400">
                 <i class="fa-solid fa-circle-notch fa-spin mr-1"></i>保存中
@@ -1223,12 +1292,6 @@ watch(
                 @toggle-active="(id) => toggleSystemActive('anthropic', id)"
                 @edit="(p, idx) => openSystemEditDialog('anthropic', p, idx)"
                 @remove="(idx) => removeSystemProvider('anthropic', idx)" />
-
-              <ProviderSection :imgIcon="providerPaddleocrIcon" title="平台托管 PaddleOCR"
-                subtitle="文档 OCR 识别服务" :providers="systemPaddleocrProviders" :active-id="systemActivePaddleocrId"
-                @add="openSystemAddDialog('paddleocr')" @toggle-active="(id) => toggleSystemActive('paddleocr', id)"
-                @edit="(p, idx) => openSystemEditDialog('paddleocr', p, idx)"
-                @remove="(idx) => removeSystemProvider('paddleocr', idx)" />
             </div>
           </section>
 
@@ -1357,12 +1420,6 @@ watch(
             @add="openAddDialog('anthropic')" @toggle-active="(id) => toggleActive('anthropic', id)"
             @edit="(p, idx) => openEditDialog('anthropic', p, idx)"
             @remove="(idx) => removeProvider('anthropic', idx)" />
-
-          <ProviderSection :imgIcon="providerPaddleocrIcon" title="PaddleOCR" subtitle="文档 OCR 识别服务"
-            :providers="paddleocrProviders" :active-id="activePaddleocrId" @add="openAddDialog('paddleocr')"
-            @toggle-active="(id) => toggleActive('paddleocr', id)"
-            @edit="(p, idx) => openEditDialog('paddleocr', p, idx)"
-            @remove="(idx) => removeProvider('paddleocr', idx)" />
         </div>
       </div>
 

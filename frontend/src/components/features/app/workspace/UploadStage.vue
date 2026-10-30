@@ -1,11 +1,9 @@
 <script setup lang="ts">
 /**
  * UploadStage.vue
- * 工作台第一页：上传与分析（模式切换 + 擦除开关 + 流程步骤 + 文件上传）
+ * 工作台第一页：上传与分析（模式切换 + 流程步骤 + 文件上传）
  */
-import BaseTooltip from '@/components/base/BaseTooltip.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import StatusBar from '@/components/features/app/workspace/StatusBar.vue'
 import FileUploader from '@/components/features/app/workspace/FileUploader.vue'
 import FileList from '@/components/features/app/workspace/FileList.vue'
@@ -14,7 +12,6 @@ import ActionBar from '@/components/features/app/workspace/ActionBar.vue'
 const props = defineProps({
   uploadMode: String,
   workflowMode: { type: String, default: 'manual' },
-  eraseEnabled: Boolean,
   // StatusBar
   statusLoading: Boolean,
   statusError: [String, null],
@@ -37,7 +34,6 @@ const props = defineProps({
 const emit = defineEmits([
   'update:upload-mode',
   'update:workflow-mode',
-  'update:erase-enabled',
   'update:selected-llm-option-id',
   'upload',
   'remove-file',
@@ -57,7 +53,7 @@ const workflowModeOptions = [
 </script>
 
 <template>
-  <!-- 工具栏：状态 + 模式切换 + 擦除开关 -->
+  <!-- 工具栏：模式切换 + 引擎状态 -->
   <div class="flex flex-wrap items-center gap-3">
     <!-- 模式切换 -->
     <BaseSegmented
@@ -73,21 +69,6 @@ const workflowModeOptions = [
       :options="workflowModeOptions"
       @update:model-value="(value) => emit('update:workflow-mode', value)"
     />
-
-    <div class="h-4 w-px bg-gray-300 dark:bg-white/[0.08] transition-colors"></div>
-
-    <!-- 擦除开关仅对试卷分割开放，笔记整理固定禁用擦除 -->
-    <BaseSwitch
-      v-if="uploadMode !== 'note'"
-      :model-value="eraseEnabled"
-      label="擦除笔迹"
-      @update:model-value="(value) => emit('update:erase-enabled', value)"
-    >
-      <BaseTooltip text="上传后自动擦除图片中的手写笔迹" placement="bottom" align="center">
-        <i
-          class="fa-solid fa-circle-question cursor-help text-[10px] text-gray-400 dark:text-[#62666d] transition-colors"></i>
-      </BaseTooltip>
-    </BaseSwitch>
 
     <!-- 引擎状态 -->
     <div class="ml-auto">
@@ -110,7 +91,7 @@ const workflowModeOptions = [
       <p class="text-sm leading-relaxed text-gray-500 dark:text-[#62666d] md:whitespace-nowrap">
         {{ uploadMode === 'note'
           ? '支持拍照或扫描件，AI 将自动识别内容并整理为结构化笔记'
-          : '支持 PDF 和图片格式，AI 将自动完成 OCR 识别、题目分割和知识点标注'
+          : '支持 PDF 和图片格式，上传后自动识别手写与红笔批改，并完成题目分割和知识点标注'
         }}
       </p>
     </div>
@@ -163,7 +144,7 @@ const workflowModeOptions = [
     <!-- 操作按钮 -->
     <ActionBar class="mt-4" :split-enabled="splitEnabled" :export-enabled="false"
       :splitting="splitting" :split-completed="splitCompleted" :upload-mode="uploadMode"
-      :workflow-mode="workflowMode" :erase-enabled="eraseEnabled"
+      :workflow-mode="workflowMode"
       @split="emit('split')" />
   </div>
 </template>
