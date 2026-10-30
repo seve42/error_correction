@@ -2,26 +2,68 @@
 
 供题目录入流程调用：把前端整理好的题目交给解题智能体，返回标准答案与完整解析。
 接口字段名已与前端约定，改动需同步前端。
+
+答案解析已是导入流程中的独立一步：前端沿用 OCR/分割的同一个 task_id 续接日志，
+所以这里复用 core.task_progress 事件中心，把分批进度、重试和 AI 原始输出实时推给前端。
 """
 
 import logging
+from typing import Optional
 
 from flask import Blueprint, request, jsonify, session
 
 from db import SessionLocal
 from db import crud
+from core import task_progress
 from core.model_selection import LLMSelectionError, resolve_llm_selection
 from core.quota import (
     has_daily_free_quota,
     quota_exceeded_response,
     uses_server_llm_selection,
 )
+from core.task_progress import EventEmitter, TaskAccessError
 from core.usage import end_usage, start_usage
 from agents.solve import invoke_solve
+from agents.solve.agent import ANSWER_STAGE, ANSWER_STEP
 
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("answers", __name__)
+
+
+def _parse_task_id(payload: dict) -> Optional[str]:
+    """从请求体读取可选的 task_id（前端 crypto.randomUUID 生成）。"""
+    raw = payload.get("task_id")
+    if raw is None or raw == "":
+        return None
+    value = str(raw).strip()
+    if not task_progress.is_valid_task_id(value):
+        raise ValueError("task_id 非法")
+    return value
+
+
+def _start_progress(task_id: Optional[str], user_id, kind: str) -> EventEmitter:
+    """登记进度任务并返回事件出口。
+
+    同一 task_id 前面已经跑过 OCR 与分割：restart=True 只清完成标记，历史事件与
+    seq 保留，前端按 after=上一个 seq 续连即可看到解答阶段的日志。
+    """
+    if not task_id:
+        return EventEmitter(None)
+    task_progress.ensure_task(task_id, user_id, kind=kind, restart=True)
+    return EventEmitter(task_id)
+
+
+def _finish_ok(emitter: EventEmitter, message: str) -> None:
+    """成功收尾：先发 success 事件再结束任务，轮询兜底也能读到最终文案。"""
+    emitter.emit(step="done", stage="完成", level="success", message=message, progress=1.0)
+    emitter.finish(ok=True, message=message)
+
+
+def _finish_failed(emitter: EventEmitter, message: str) -> None:
+    """失败收尾：错误事件 + 结束标记，前端无需等到超时。"""
+    emitter.emit(step="done", stage="完成", level="error", message=message)
+    emitter.finish(ok=False, message=message)
 
 
 def _build_content_text(content_blocks) -> tuple[str, list[str]]:
@@ -72,6 +114,15 @@ def generate_answers():
         return jsonify({"success": False, "error": "题目格式不正确"}), 400
 
     user_id = session.get("user_id")
+    try:
+        task_id = _parse_task_id(data)
+    except ValueError:
+        return jsonify({"success": False, "error": "task_id 非法", "code": "INVALID_TASK_ID"}), 400
+    try:
+        emitter = _start_progress(task_id, user_id, "answers")
+    except TaskAccessError:
+        return jsonify({"success": False, "error": "任务不存在"}), 403
+
     model_provider = data.get("model_provider") or "openai"
     model_name = data.get("model_name") or None
     provider_source = data.get("provider_source") or None
@@ -88,6 +139,7 @@ def generate_answers():
                 provider_id=provider_id,
             )
         except LLMSelectionError as e:
+            _finish_failed(emitter, e.message)
             return (
                 jsonify({"success": False, "code": e.code, "error": e.message}),
                 e.status_code,
@@ -104,14 +156,25 @@ def generate_answers():
             quota_user = crud.get_user_by_id(db, user_id)
             if not quota_user:
                 session.clear()
+                _finish_failed(emitter, "用户不存在")
                 return jsonify({"success": False, "error": "用户不存在"}), 401
             if not has_daily_free_quota(db, quota_user):
                 payload, status = quota_exceeded_response(db, quota_user)
+                message = payload.get("error") or "今日免费体验次数已用完"
+                _finish_failed(emitter, message)
                 return jsonify(payload), status
 
     solve_inputs = [
         _build_solve_input(question, index) for index, question in enumerate(questions)
     ]
+    total = len(solve_inputs)
+    emitter.emit(
+        step=ANSWER_STEP,
+        stage=ANSWER_STAGE,
+        level="info",
+        message=f"开始生成标准答案解析：共 {total} 道题目",
+        progress=0.0,
+    )
 
     usage_ctx = start_usage(
         user_id,
@@ -124,9 +187,11 @@ def generate_answers():
             solve_inputs,
             provider=selection["category"],
             model_name=selection["model_name"],
+            emitter=emitter,
         )
     except Exception:
         logger.exception("生成标准答案解析失败")
+        _finish_failed(emitter, "生成标准答案解析失败，请稍后重试")
         return jsonify({"success": False, "error": "AI 生成答案解析失败，请稍后重试"}), 502
     finally:
         end_usage(usage_ctx)
@@ -147,4 +212,7 @@ def generate_answers():
             }
         )
 
+    answered = sum(1 for item in results if item["answer"])
+    summary = f"标准答案解析生成完成：{answered}/{total} 道题"
+    _finish_ok(emitter, summary)
     return jsonify({"success": True, "results": results})

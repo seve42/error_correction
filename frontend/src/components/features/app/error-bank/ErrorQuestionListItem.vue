@@ -3,6 +3,7 @@
  * ErrorQuestionListItem.vue
  * 错题库左侧列表中的单道题目卡片。
  */
+import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseTag from '@/components/base/BaseTag.vue'
 import { calculateQuestionPriority, getQuestionSnippet } from '@/utils/index'
 
@@ -10,7 +11,6 @@ const props = defineProps({
   question: { type: Object, required: true },
   index: { type: Number, required: true },
   active: { type: Boolean, default: false },
-  selectMode: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
 })
 
@@ -40,27 +40,20 @@ const questionText = (question, maxLen = 120) => getQuestionSnippet(question, ma
     :class="active ? 'bg-gray-100 dark:bg-white/[0.075]' : ''"
     @click="emit('click', question)"
   >
-    <div
-      v-if="selectMode"
-      class="flex w-9 items-center justify-center border-r border-gray-200 dark:border-white/[0.06]"
-      @click.stop="emit('toggle-select', question.id)"
-    >
-      <div
-        class="flex h-4 w-4 items-center justify-center rounded border"
-        :class="selected ? 'accent-bg accent-border text-white' : 'border-gray-300 dark:border-white/[0.18]'"
-      >
-        <i v-if="selected" class="fa-solid fa-check text-[9px]"></i>
+    <div class="flex shrink-0 items-stretch border-r border-gray-200 dark:border-white/[0.06]">
+      <div class="flex w-9 items-center justify-center" @click.stop>
+        <BaseCheckbox :model-value="selected" @update:model-value="emit('toggle-select', question.id)" />
       </div>
-    </div>
-    <div v-else class="flex w-14 flex-col items-center justify-center border-r border-gray-200 dark:border-white/[0.06]">
-      <span
-        class="flex h-8 w-8 items-center justify-center rounded-full text-sm font-black text-white"
-        :class="active ? 'accent-bg' : 'bg-orange-500/80'"
-      >
-        {{ index }}
-      </span>
-      <span class="mt-2 text-xs font-bold accent-text">{{ questionPriority(question) }}%</span>
-      <span class="text-[10px] text-gray-400 dark:text-[#62666d]">优先级</span>
+      <div class="flex w-14 flex-col items-center justify-center border-l border-gray-200 dark:border-white/[0.06]">
+        <span
+          class="flex h-8 w-8 items-center justify-center rounded-full text-sm font-black text-white"
+          :class="active ? 'accent-bg' : 'bg-orange-500/80'"
+        >
+          {{ index }}
+        </span>
+        <span class="mt-2 text-xs font-bold accent-text">{{ questionPriority(question) }}%</span>
+        <span class="text-[10px] text-gray-400 dark:text-[#62666d]">优先级</span>
+      </div>
     </div>
 
     <div class="min-w-0 p-4">

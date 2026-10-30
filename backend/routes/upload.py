@@ -1,18 +1,20 @@
 import os
 import json
+import time
 import uuid
 import logging
 from datetime import timezone
 from pathlib import PurePath
 from typing import Optional
 
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, Response, request, jsonify, session
 
 import core.state as state
 from core.state import (
     workflow_graph,
     session_lock,
     get_user_session,
+    ordered_file_keys,
 )
 from db import SessionLocal
 from db import crud
@@ -26,10 +28,62 @@ from core.quota import (
     uses_server_ocr,
 )
 from pipeline.utils import export_wrongbook as export_wrongbook_md
+from core.task_progress import (
+    EventEmitter,
+    PLACEHOLDER_WAIT_SECONDS,
+    STREAM_KEEPALIVE_SECONDS,
+    TaskAccessError,
+    ensure_task,
+    is_valid_task_id,
+    snapshot,
+    wait_events,
+)
 
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("upload", __name__)
+
+
+# ---------------------------------------------------------------------------
+# 进度任务（SSE）辅助
+# ---------------------------------------------------------------------------
+
+
+def _parse_task_id(payload: dict) -> Optional[str]:
+    """从请求体读取可选的 task_id（前端 crypto.randomUUID 生成）。"""
+    raw = payload.get("task_id")
+    if raw is None or raw == "":
+        return None
+    value = str(raw).strip()
+    if not is_valid_task_id(value):
+        raise ValueError("task_id 非法")
+    return value
+
+
+def _start_progress(task_id: Optional[str], user_id, kind: str) -> EventEmitter:
+    """登记进度任务并返回事件出口。
+
+    同一 task_id 会被前端连续用于 OCR 与分割两个阶段：POST 时 restart=True 只清
+    上一阶段的完成标记，历史事件与 seq 保留，前端按 after=上一个 seq 续连即可拿到
+    新阶段事件。task_id 为空时返回 no-op emitter，进度事件不影响主流程。
+    """
+    if not task_id:
+        return EventEmitter(None)
+    ensure_task(task_id, user_id, kind=kind, restart=True)
+    return EventEmitter(task_id)
+
+
+def _finish_ok(emitter: EventEmitter, message: str) -> None:
+    """成功收尾：先发 success 事件再结束任务，轮询兜底也能读到最终文案。"""
+    emitter.emit(step="done", stage="完成", level="success", message=message, progress=1.0)
+    emitter.finish(ok=True, message=message)
+
+
+def _finish_failed(emitter: EventEmitter, message: str) -> None:
+    """失败收尾：错误事件 + 结束标记，前端无需等到超时。"""
+    emitter.emit(step="done", stage="完成", level="error", message=message)
+    emitter.finish(ok=False, message=message)
+
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +380,17 @@ def upload_file():
         file_keys = request.form.getlist("file_key")
         if not file_keys:
             file_keys = request.form.getlist("file_keys")
+        # 前端并发分批上传时，请求到达顺序与用户选择顺序无关，
+        # 所以每个文件额外带上它在本次选择中的全局序号，供后续按序识别。
+        file_orders = request.form.getlist("file_order")
 
         prepared = []
         for i, file in enumerate(files):
             if file.filename == "":
                 continue
             fk = file_keys[i] if i < len(file_keys) and file_keys[i] else None
-            prepared.append((fk, file))
+            order = file_orders[i] if i < len(file_orders) and file_orders[i] else None
+            prepared.append((fk, order, file))
 
         if not prepared:
             return jsonify({"error": "没有上传文件"}), 400
@@ -341,7 +399,7 @@ def upload_file():
         uid = session.get("user_id")
         if should_reset_session:
             _clear_upload_runtime_state(uid)
-        for fk, file in prepared:
+        for fk, order, file in prepared:
             file_key = fk or f"{uuid.uuid4().hex}"
 
             original_ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
@@ -374,6 +432,7 @@ def upload_file():
                 us["session_files"][file_key] = {
                     "filename": file.filename,
                     "filepath": filepath,
+                    "order": int(order) if order and str(order).isdigit() else None,
                 }
                 if file_key not in us["session_file_order"]:
                     us["session_file_order"].append(file_key)
@@ -486,7 +545,7 @@ def run_erase():
         uid = session.get("user_id")
         with session_lock:
             us = get_user_session(uid)
-            keys = list(us["session_file_order"])
+            keys = ordered_file_keys(us)
             file_paths = []
             for k in keys:
                 v = us["session_files"].get(k) or {}
@@ -575,6 +634,7 @@ def run_ocr():
     不触发 Agent 分割。
     如果之前调用过 /api/erase，则使用擦除后的图片。
     """
+    emitter = EventEmitter(None)
     try:
         # 加载 OCR 凭据
         user_id = session.get("user_id")
@@ -582,6 +642,19 @@ def run_ocr():
         engine = str(request_data.get("engine") or "paddleocr").strip().lower()
         if engine not in ("vision", "paddleocr"):
             engine = "paddleocr"
+
+        # 进度任务必须在耗时工作之前登记：前端可能先连 SSE 再发 POST，
+        # 事件早于 SSE 也不会丢，因为订阅方按 seq 回放已有事件。
+        try:
+            task_id = _parse_task_id(request_data)
+        except ValueError:
+            return jsonify({"success": False, "error": "task_id 非法", "code": "INVALID_TASK_ID"}), 400
+        try:
+            emitter = _start_progress(task_id, user_id, "ocr")
+        except TaskAccessError:
+            return jsonify({"success": False, "error": "任务不存在"}), 403
+        emitter.emit(step="prepare", stage="准备", message="正在准备视觉识别任务…")
+
         ocr_credentials = {}
         vision_credentials = None
         _mark_server_ocr_cache(user_id, False)
@@ -593,6 +666,12 @@ def run_ocr():
                 vision_credentials = resolve_vision_credentials(db, user_id)
                 if not vision_credentials:
                     logger.warning("未配置支持图像理解的 Provider，/api/ocr 回退 PaddleOCR")
+                    emitter.emit(
+                        step="prepare",
+                        stage="准备",
+                        level="warn",
+                        message="未配置支持图像理解的模型，本次回退 PaddleOCR 识别",
+                    )
                     engine = "paddleocr"
             if user_id:
                 ocr_provider = crud.get_active_provider(db, user_id, "paddleocr")
@@ -617,7 +696,7 @@ def run_ocr():
         if not file_paths:
             with session_lock:
                 us = get_user_session(user_id)
-                keys = list(us["session_file_order"])
+                keys = ordered_file_keys(us)
                 file_paths = []
                 for k in keys:
                     v = us["session_files"].get(k) or {}
@@ -626,6 +705,7 @@ def run_ocr():
                         file_paths.append(fp)
 
         if not file_paths:
+            _finish_failed(emitter, "请先上传文件")
             return jsonify({"success": False, "error": "请先上传文件"}), 400
 
         # 标准化输入（PDF → 图片）
@@ -634,6 +714,15 @@ def run_ocr():
         all_image_paths = []
         for fp in file_paths:
             all_image_paths.extend(prepare_input(fp))
+        emitter.emit(
+            step="prepare",
+            stage="准备",
+            level="success",
+            # prepare_input 只做格式标准化与落盘，PDF 不在此处拆页，
+            # 所以这里报「文件数」而不是页数，真实页数由识别阶段（vision_load）上报。
+            message=f"已准备 {len(all_image_paths)} 个输入文件，开始识别…",
+            progress=1.0,
+        )
 
         # ── 视觉 OCR：deepseek-flash 直接读原图，输出带笔迹/批改标签的结构化结果 ──
         if engine == "vision":
@@ -646,7 +735,15 @@ def run_ocr():
                     quota_user = crud.get_user_by_id(db, user_id)
                     if quota_user and not has_daily_free_quota(db, quota_user, amount=1):
                         payload, status = quota_exceeded_response(db, quota_user, amount=1)
+                        _finish_failed(emitter, payload.get("error") or "今日免费额度已用完")
                         return jsonify(payload), status
+            # 知识点标签池：视觉调用早于科目识别，只能给全量标签供模型自行匹配复用
+            try:
+                with SessionLocal() as db:
+                    existing_tags = ",".join(crud.get_existing_tag_names(db))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("加载已有知识点标签失败（不影响打标）: %s", exc)
+                existing_tags = ""
             vision_client = VisionOCRClient(
                 api_key=vision_credentials["api_key"],
                 base_url=vision_credentials.get("base_url") or "",
@@ -660,7 +757,10 @@ def run_ocr():
             )
             try:
                 result = vision_client.parse_document(
-                    all_image_paths, output_dir=str(settings.pages_dir)
+                    all_image_paths,
+                    output_dir=str(settings.pages_dir),
+                    emitter=emitter,
+                    existing_tags=existing_tags,
                 )
                 if vision_is_system and user_id:
                     record_fallback_usage(
@@ -686,6 +786,7 @@ def run_ocr():
                         "blocks": page.get("blocks") or [],
                     }
                 )
+            _finish_ok(emitter, f"视觉识别完成，共 {len(preview_pages)} 页")
             return jsonify(
                 {
                     "success": True,
@@ -701,6 +802,12 @@ def run_ocr():
         from pipeline.paddleocr_client import PaddleOCRClient
         from pipeline.utils import simplify_ocr_results
         from pipeline.workflow import run_async
+
+        emitter.emit(
+            step="vision_batch",
+            stage="视觉识别",
+            message=f"正在使用 PaddleOCR 识别 {len(all_image_paths)} 页图片…",
+        )
 
         creds = ocr_credentials or {}
         client = PaddleOCRClient(
@@ -733,6 +840,7 @@ def run_ocr():
                 logger.exception("OCR 图片失败")
 
         if not raw_ocr_results:
+            _finish_failed(emitter, "OCR 解析失败，请检查 PaddleOCR 配置")
             return (
                 jsonify(
                     {"success": False, "error": "OCR 解析失败，请检查 PaddleOCR 配置"}
@@ -820,6 +928,7 @@ def run_ocr():
                 )
                 page_idx += 1
 
+        _finish_ok(emitter, f"OCR 完成，共 {len(preview_pages)} 页")
         return jsonify(
             {
                 "success": True,
@@ -831,7 +940,108 @@ def run_ocr():
 
     except Exception:
         logger.exception("OCR 执行失败")
+        _finish_failed(emitter, "OCR 执行失败，请稍后重试")
         return jsonify({"success": False, "error": "OCR 执行失败，请稍后重试"}), 500
+
+
+# ---------------------------------------------------------------------------
+# 进度订阅：SSE 主通道 + 轮询兜底
+# ---------------------------------------------------------------------------
+
+
+@bp.route("/task/<task_id>/stream", methods=["GET"])
+def stream_task_progress(task_id):
+    """推送某个任务的实时进度事件（text/event-stream）。"""
+    if not is_valid_task_id(task_id):
+        return jsonify({"success": False, "error": "task_id 非法"}), 400
+    user_id = session.get("user_id")
+    try:
+        # 前端往往先连 SSE 再发 POST：先建占位任务，POST 到达前只发心跳。
+        ensure_task(task_id, user_id, kind="stream")
+    except TaskAccessError:
+        return jsonify({"success": False, "error": "任务不存在"}), 403
+    after = request.args.get("after", 0, type=int) or 0
+
+    def generate():
+        cursor = max(after, 0)
+        while True:
+            try:
+                payload = wait_events(
+                    task_id,
+                    after=cursor,
+                    timeout=STREAM_KEEPALIVE_SECONDS,
+                    user_id=user_id,
+                )
+            except TaskAccessError:
+                return
+            events = payload.get("events") or []
+            for event in events:
+                cursor = max(cursor, int(event.get("seq") or 0))
+                yield f"event: progress\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if events:
+                if payload.get("finished"):
+                    # 回放完剩余事件时任务已结束：立即补发 done 关闭，不再等待。
+                    body = {
+                        "ok": bool(payload.get("ok")),
+                        "message": payload.get("message") or "",
+                    }
+                    yield f"event: done\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
+                    return
+                continue
+            if payload.get("finished"):
+                # 已追平最后一帧却仍是完成态：可能只是阶段间隙（前端复用同一
+                # task_id，下一阶段 POST 未到），短暂等待 reopen；没有新 POST 则
+                # 补发 done 关闭连接。
+                restarted = False
+                deadline = time.monotonic() + PLACEHOLDER_WAIT_SECONDS
+                while time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    current = snapshot(task_id, after=cursor, user_id=user_id)
+                    if current is None:
+                        return
+                    if current.get("events") or not current.get("finished"):
+                        restarted = True
+                        break
+                if restarted:
+                    continue
+                body = {
+                    "ok": bool(payload.get("ok")),
+                    "message": payload.get("message") or "",
+                }
+                yield f"event: done\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
+                return
+            yield ": ping\n\n"
+
+    response = Response(generate(), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@bp.route("/task/<task_id>", methods=["GET"])
+def get_task_progress(task_id):
+    """轮询兜底：SSE 不可用时前端按 after 拉取增量事件。"""
+    if not is_valid_task_id(task_id):
+        return jsonify({"success": False, "error": "task_id 非法"}), 400
+    user_id = session.get("user_id")
+    after = request.args.get("after", 0, type=int) or 0
+    try:
+        ensure_task(task_id, user_id, kind="poll")
+        payload = snapshot(task_id, after=after, user_id=user_id)
+    except TaskAccessError:
+        return jsonify({"success": False, "error": "任务不存在"}), 403
+    if payload is None:
+        payload = {"events": [], "finished": False, "ok": False, "message": ""}
+    return jsonify(
+        {
+            "success": True,
+            "task_id": task_id,
+            "events": payload.get("events") or [],
+            "finished": bool(payload.get("finished")),
+            "ok": bool(payload.get("ok")),
+            "message": payload.get("message") or "",
+        }
+    )
 
 
 @bp.route("/split", methods=["POST"])
@@ -847,7 +1057,9 @@ def split_questions():
     """
     run_id = None
     user_id = None
+    task_id = None
     required_quota_amount = 1
+    emitter = EventEmitter(None)
     try:
         # 读取请求体参数（模型供应商 + 模型名称）
         data = request.get_json(silent=True) or {}
@@ -858,8 +1070,17 @@ def split_questions():
         ocr_engine = str(data.get("ocr_engine") or "paddleocr").strip().lower()
         if ocr_engine not in ("vision", "paddleocr"):
             ocr_engine = "paddleocr"
+        try:
+            task_id = _parse_task_id(data)
+        except ValueError:
+            return jsonify({"success": False, "error": "task_id 非法", "code": "INVALID_TASK_ID"}), 400
         # 从数据库加载用户的 LLM + OCR 凭据
         user_id = session.get("user_id")
+        try:
+            emitter = _start_progress(task_id, user_id, "split")
+        except TaskAccessError:
+            return jsonify({"success": False, "error": "任务不存在"}), 403
+        emitter.emit(step="prepare", stage="准备", message="正在准备分割任务…")
         ocr_credentials = {}
         vision_credentials = None
         fallback_warning = ""
@@ -875,6 +1096,7 @@ def split_questions():
                     provider_id=provider_id,
                 )
             except LLMSelectionError as e:
+                _finish_failed(emitter, e.message)
                 return (
                     jsonify({"success": False, "code": e.code, "error": e.message}),
                     e.status_code,
@@ -887,6 +1109,12 @@ def split_questions():
                     logger.warning("未配置支持图像理解的 Provider，分割回退 PaddleOCR")
                     ocr_engine = "paddleocr"
                     fallback_warning = "未配置支持图像理解的模型，已回退 PaddleOCR 识别"
+                    emitter.emit(
+                        step="prepare",
+                        stage="准备",
+                        level="warn",
+                        message=fallback_warning,
+                    )
             if user_id:
                 uses_server_side_ocr = uses_server_ocr(db, user_id) or (
                     ocr_engine == "vision"
@@ -904,6 +1132,7 @@ def split_questions():
                     quota_user = crud.get_user_by_id(db, user_id)
                     if not quota_user:
                         session.clear()
+                        _finish_failed(emitter, "用户不存在")
                         return jsonify({"success": False, "error": "用户不存在"}), 401
                     # 点数按模型实际费用在调用结束后结算，这里只做最低 1 点的预检。
                     required_quota_amount = 1
@@ -913,6 +1142,7 @@ def split_questions():
                             quota_user,
                             amount=required_quota_amount,
                         )
+                        _finish_failed(emitter, payload.get("error") or "今日免费额度已用完")
                         return jsonify(payload), status
 
                 ocr_provider = crud.get_active_provider(db, user_id, "paddleocr")
@@ -928,7 +1158,7 @@ def split_questions():
 
         with session_lock:
             us = get_user_session(user_id)
-            keys = list(us["session_file_order"])
+            keys = ordered_file_keys(us)
             file_paths = []
             for k in keys:
                 v = us["session_files"].get(k) or {}
@@ -937,13 +1167,14 @@ def split_questions():
                     file_paths.append(fp)
 
         if not file_paths:
+            _finish_failed(emitter, "请先上传文件")
             return jsonify({"success": False, "error": "请先上传文件"}), 400
 
         with session_lock:
             us = get_user_session(user_id)
             file_names = [
                 us["session_files"].get(k, {}).get("filename", "Unknown")
-                for k in us["session_file_order"]
+                for k in ordered_file_keys(us)
             ]
 
         with SessionLocal() as db:
@@ -955,6 +1186,13 @@ def split_questions():
             )
             run_id = run.public_id
             result_dir = run.result_dir
+        emitter.emit(
+            step="prepare",
+            stage="准备",
+            level="success",
+            message=f"已创建运行记录 {run_id}，共 {len(file_paths)} 个文件",
+            progress=1.0,
+        )
 
         with session_lock:
             us = get_user_session(user_id)
@@ -971,6 +1209,7 @@ def split_questions():
             "vision_credentials": vision_credentials or {},
             "ocr_cache_path": _cache_path(ocr_engine, user_id),
             "results_dir": result_dir,
+            "task_id": task_id,
         }
         from core.usage import start_usage, end_usage, record_fallback_usage
 
@@ -998,6 +1237,11 @@ def split_questions():
             system_stages=system_stages,
         )
         try:
+            emitter.emit(
+                step="split",
+                stage="分割题目",
+                message="开始识别与分割题目…",
+            )
             workflow_graph.invoke(initial_state, config=config)
             result_state = workflow_graph.invoke(None, config=config)
             if "llm" in system_stages and user_id:
@@ -1018,6 +1262,14 @@ def split_questions():
         warnings = list(result_state.get("warnings", []) or [])
         if fallback_warning:
             warnings.insert(0, fallback_warning)
+        if questions:
+            emitter.emit(
+                step="split",
+                stage="分割题目",
+                level="success",
+                message=f"分割完成：共 {len(questions)} 道题目",
+                progress=1.0,
+            )
 
         if not questions:
             failure_message = (
@@ -1032,6 +1284,7 @@ def split_questions():
                     user_id=user_id,
                     error_message=failure_message,
                 )
+            _finish_failed(emitter, failure_message)
             return (
                 jsonify(
                     {
@@ -1048,12 +1301,13 @@ def split_questions():
 
         # 自动保存分割记录
         try:
+            emitter.emit(step="split", stage="分割题目", message="正在保存分割结果…")
             subject = _read_split_subject(result_dir)
 
             with session_lock:
                 us = get_user_session(user_id)
                 session_files = [
-                    us["session_files"].get(k, {}) for k in us["session_file_order"]
+                    us["session_files"].get(k, {}) for k in ordered_file_keys(us)
                 ]
                 file_names = [
                     item.get("filename", "Unknown") for item in session_files
@@ -1080,6 +1334,7 @@ def split_questions():
         except Exception:
             logger.warning("保存分割记录失败，不影响主流程", exc_info=True)
 
+        _finish_ok(emitter, f"成功分割 {len(questions)} 道题目")
         return jsonify(
             {
                 "success": True,
@@ -1101,6 +1356,7 @@ def split_questions():
                     )
             except Exception:
                 logger.warning("failed to mark workflow run as failed", exc_info=True)
+        _finish_failed(emitter, "题目分割失败，请稍后重试")
         return jsonify({"success": False, "error": "题目分割失败，请稍后重试"}), 500
 
 

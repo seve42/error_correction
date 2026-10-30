@@ -22,6 +22,9 @@ type AiAnalysisOptions = {
   modelName?: string
 }
 
+/** 生成答案解析时可选的任务日志参数：同一 task_id 会续接 OCR/分割的进度事件。 */
+type GenerateAnswersOptions = AiAnalysisOptions & { taskId?: string | null }
+
 /** 生成标准答案解析时提交的单题字段，顺序与响应一一对应。 */
 export type GeneratedAnswerQuestion = {
   uid?: string | null
@@ -58,18 +61,28 @@ type AiAnalysisResponse = {
   message?: string
 }
 
-export async function fetchErrorBank(params: ErrorBankQueryParams = {}) {
+function toQueryString(params: ErrorBankQueryParams) {
   const qs = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) {
     if (Array.isArray(v)) {
       if (v.length) qs.set(k, v.join(','))
     } else if (v !== null && v !== undefined && v !== '') qs.set(k, String(v))
   }
-  const resp = await fetch(`/api/error-bank?${qs}`)
+  return qs.toString()
+}
+
+export async function fetchErrorBank(params: ErrorBankQueryParams = {}) {
+  const resp = await fetch(`/api/error-bank?${toQueryString(params)}`)
   return assertJsonSuccess<{ success: true; items: ErrorBankQuestion[]; total?: number; grand_total?: number; total_pages?: number }>(
     resp,
     '查询错题库失败',
   )
+}
+
+/** 按当前筛选条件获取全部题目 ID，供错题库「全选所有筛选结果」（跨页）使用。 */
+export async function fetchErrorBankIds(params: ErrorBankQueryParams = {}) {
+  const resp = await fetch(`/api/error-bank/ids?${toQueryString(params)}`)
+  return assertJsonSuccess<{ success: true; ids: Id[]; total?: number }>(resp, '获取题目列表失败')
 }
 
 export async function findQuestionsByDescription(query: string, { projectId, limit = 8 }: FindQuestionsOptions = {}) {
@@ -127,6 +140,16 @@ export async function exportFromDb(selectedIds: Id[]) {
 export async function deleteQuestion(questionId: Id) {
   const resp = await fetch(`/api/question/${questionId}`, { method: 'DELETE' })
   return assertJsonSuccess(resp, '删除失败')
+}
+
+/** 批量删除题目（一次请求删除多道题）。 */
+export async function batchDeleteQuestions(questionIds: Id[]) {
+  const resp = await fetch('/api/questions/batch-delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: questionIds }),
+  })
+  return assertJsonSuccess<{ success: true; deleted: number; message?: string }>(resp, '批量删除失败')
 }
 
 export async function updateReviewStatus(questionId: Id, reviewStatus: string) {
@@ -204,13 +227,14 @@ export async function saveQuestionAnswer(questionId: Id, answer: string) {
  */
 export async function generateAnswers(
   questions: GeneratedAnswerQuestion[],
-  { providerSource, providerId, modelProvider, modelName }: AiAnalysisOptions = {},
+  { providerSource, providerId, modelProvider, modelName, taskId }: GenerateAnswersOptions = {},
 ): Promise<GeneratedAnswer[]> {
   const body: Record<string, unknown> = { questions }
   if (modelProvider) body.model_provider = modelProvider
   if (modelName) body.model_name = modelName
   if (providerSource) body.provider_source = providerSource
   if (providerId) body.provider_id = providerId
+  if (taskId) body.task_id = taskId
 
   const resp = await fetch('/api/generate-answers', {
     method: 'POST',

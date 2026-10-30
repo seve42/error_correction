@@ -1,14 +1,40 @@
 <script setup lang="ts">
 /**
  * SplitLoading.vue
- * 分割加载动画
+ * 分割/识别加载动画：在原有扫描动画上叠加真实任务进度与日志面板。
+ *
+ * 后端未推送事件时 progress 为 null，进度条保持原来的 indeterminate 动画，
+ * 保证旧后端或 SSE 不可用时页面不报错、不卡死。
  */
+import { computed } from 'vue'
 import BaseLogo from '@/components/base/BaseLogo.vue'
+import TaskLogPanel from './TaskLogPanel.vue'
+import type { TaskProgressEvent } from '@/api/task'
 
-defineProps({
-  title: { type: String, default: 'AI 正在深度解析' },
-  subtitle: { type: String, default: '正在识别题目结构、提取知识点并构建图谱' },
+const props = withDefaults(
+  defineProps<{
+    title?: string
+    subtitle?: string
+    progress?: number | null
+    stage?: string
+    events?: TaskProgressEvent[]
+    running?: boolean
+  }>(),
+  {
+    title: 'AI 正在深度解析',
+    subtitle: '正在识别题目结构、提取知识点并构建图谱',
+    progress: null,
+    stage: '',
+    events: () => [],
+    running: true,
+  },
+)
+
+const hasRealProgress = computed(() => {
+  if (props.progress === null || props.progress === undefined) return false
+  return Number.isFinite(Number(props.progress))
 })
+const realPercent = computed(() => Math.max(0, Math.min(100, Number(props.progress) || 0)))
 </script>
 
 <template>
@@ -40,13 +66,30 @@ defineProps({
         <div class="text-container">
           <h3 class="status-title text-slate-900 dark:text-white transition-colors">{{ title }}</h3>
           <p class="status-subtitle text-slate-500 dark:text-slate-400 transition-colors">{{ subtitle }}</p>
+          <p v-if="stage" class="stage-text text-slate-500 dark:text-slate-400 transition-colors">当前阶段：{{ stage }}</p>
 
-          <!-- 模拟进度条 -->
+          <!-- 真实进度优先，拿不到进度时保留原模拟动画 -->
           <div class="progress-container">
-            <div class="progress-bar">
+            <div
+              v-if="hasRealProgress"
+              class="progress-bar-determinate"
+              :style="{ width: `${realPercent}%` }"
+            ></div>
+            <div v-else class="progress-bar">
               <div class="progress-glow"></div>
             </div>
           </div>
+        </div>
+
+        <!-- 实时日志：任务运行中默认展开，可折叠；日志区自身滚动，整块高度自适应 -->
+        <div v-if="running || events.length" class="log-container">
+          <TaskLogPanel
+            :events="events"
+            :running="running"
+            :progress="progress ?? null"
+            :stage="stage"
+            default-open
+          />
         </div>
       </div>
     </div>
@@ -68,7 +111,12 @@ defineProps({
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 3rem;
+  gap: 2rem;
+  /* 日志面板展开后整体可能超出视口，改为整块滚动、日志区内部再滚动 */
+  width: min(760px, 92vw);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 1.5rem 0;
 }
 
 /* --- 核心动画容器 --- */
@@ -174,6 +222,25 @@ defineProps({
   background: rgb(var(--accent-rgb) / 0.05);
   border-radius: 999px;
   overflow: hidden;
+}
+
+.stage-text {
+  margin-top: 0.75rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* 真实进度：宽度随事件 progress 变化，不再跑模拟动画 */
+.progress-bar-determinate {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgb(var(--accent-rgb)), rgb(var(--accent-hover-rgb)));
+  transition: width 0.3s ease;
+}
+
+.log-container {
+  width: 100%;
 }
 
 .progress-bar {

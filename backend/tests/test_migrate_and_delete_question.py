@@ -1,4 +1,4 @@
-from db.crud.questions import delete_question
+from db.crud.questions import delete_question, delete_questions
 from db.migrate import _ensure_default_question_project
 from db.models import Project, Question, UploadBatch, User
 
@@ -70,4 +70,45 @@ def test_delete_question_removes_empty_batch_in_same_operation(db):
 
     assert delete_question(db, question.id, user_id=user.id) is True
     assert db.query(Question).filter(Question.id == question.id).first() is None
+    assert db.query(UploadBatch).filter(UploadBatch.id == batch_id).first() is None
+
+
+def test_delete_questions_removes_selected_and_cleans_empty_batch(db):
+    user = User(email="u4@example.com", username="u4", password_hash="x")
+    db.add(user)
+    db.commit()
+
+    batch = UploadBatch(
+        user_id=user.id,
+        project_id=None,
+        original_filename="b.pdf",
+        subject="数学",
+        file_path="/tmp/b.pdf",
+    )
+    db.add(batch)
+    db.flush()
+    batch_id = batch.id
+
+    questions = [
+        Question(
+            user_id=user.id,
+            project_id=None,
+            batch_id=batch_id,
+            content_hash=f"hash-batch-{index}",
+            question_type="选择题",
+            content_json='[{"block_type":"text","content":"题目"}]',
+        )
+        for index in range(2)
+    ]
+    db.add_all(questions)
+    db.commit()
+
+    question_ids = [question.id for question in questions]
+
+    # 不属于该用户的题目不会被删除
+    assert delete_questions(db, question_ids, user_id=user.id + 100) == 0
+    assert db.query(Question).count() == 2
+
+    assert delete_questions(db, question_ids, user_id=user.id) == 2
+    assert db.query(Question).filter(Question.id.in_(question_ids)).first() is None
     assert db.query(UploadBatch).filter(UploadBatch.id == batch_id).first() is None

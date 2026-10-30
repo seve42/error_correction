@@ -11,6 +11,10 @@ defineProps({
   uploadReady: { type: Boolean, default: false },
   splitting: { type: Boolean, default: false },
   splitCompleted: { type: Boolean, default: false },
+  // 聚合进度：文件列表是最直观看到"几百张图传到哪了"的位置
+  uploadPercent: { type: Number, default: 0 },
+  uploadDone: { type: Number, default: 0 },
+  uploadTotal: { type: Number, default: 0 },
 })
 const emit = defineEmits(['remove-file'])
 </script>
@@ -19,13 +23,25 @@ const emit = defineEmits(['remove-file'])
   <Transition
     enter-active-class="transition-all duration-500 ease-out"
     enter-from-class="opacity-0 -translate-y-4 max-h-0"
-    enter-to-class="opacity-100 translate-y-0 max-h-40"
+    enter-to-class="opacity-100 translate-y-0 max-h-48"
     leave-active-class="transition-all duration-300 ease-in"
-    leave-from-class="opacity-100 translate-y-0 max-h-40"
+    leave-from-class="opacity-100 translate-y-0 max-h-48"
     leave-to-class="opacity-0 -translate-y-4 max-h-0"
   >
     <div v-if="pendingFiles.length" class="relative z-20 w-full overflow-hidden shrink-0">
-      <div class="flex flex-wrap items-center gap-2">
+      <!-- 总体上传进度，先给整体感知再逐文件查看 -->
+      <div v-if="uploadTotal > 0" class="mb-2 flex items-center gap-3">
+        <span class="shrink-0 text-[11px] text-gray-500 dark:text-[#8a8f98] transition-colors">
+          已上传 <span class="font-semibold text-gray-700 dark:text-[#c9cdd4]">{{ uploadDone }}</span>/{{ uploadTotal }} · {{ uploadPercent }}%
+        </span>
+        <div class="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-gray-200/80 dark:bg-white/[0.08]">
+          <div
+            class="h-full rounded-full accent-bg transition-[width] duration-500 ease-out"
+            :style="{ width: uploadPercent + '%' }"
+          ></div>
+        </div>
+      </div>
+      <div class="flex max-h-40 flex-wrap items-center gap-2 overflow-y-auto pr-1 custom-scrollbar">
         <div
           v-for="item in pendingFiles"
           :key="item.key"

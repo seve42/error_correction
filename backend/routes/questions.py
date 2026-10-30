@@ -51,6 +51,24 @@ def _project_id_body(data):
         return None
 
 
+def _split_page_images(raw_value):
+    """page_image_ref 兼容旧版单张 URL 与新版 JSON 数组，返回 (图片列表, 首张)。
+
+    旧数据只存一张整页图；跨页题目存 JSON 数组，前端按列表展示全部页面图。
+    """
+    raw = (raw_value or "").strip()
+    if not raw:
+        return [], None
+    if raw.startswith("["):
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError):
+            return [], None
+        images = [value for value in values if isinstance(value, str) and value.strip()]
+        return images, images[0] if images else None
+    return [raw], raw
+
+
 def _serialize_question(q: Question) -> dict:
     """将 Question ORM 对象序列化为前端 JSON 格式"""
     subject = None
@@ -61,6 +79,8 @@ def _serialize_question(q: Question) -> dict:
         for mapping in q.tags:
             if mapping.tag:
                 knowledge_tags.append(mapping.tag.tag_name)
+
+    page_images, page_image = _split_page_images(q.page_image_ref)
 
     return {
         'id': q.id,
@@ -74,6 +94,8 @@ def _serialize_question(q: Question) -> dict:
         'subject': subject,
         'knowledge_tags': knowledge_tags,
         'created_at': q.created_at.isoformat() if q.created_at else None,
+        'page_images': page_images,
+        'page_image': page_image,
     }
 
 
@@ -86,8 +108,6 @@ def _serialize_question_detail(q: Question) -> dict:
     base['updated_at'] = q.updated_at.isoformat() if q.updated_at else None
     base['review_status'] = q.review_status or '待复习'
     base['image_refs_json'] = json.loads(q.image_refs_json) if q.image_refs_json else None
-    # 整页原图引用（前端用该字段展示整页图片）
-    base['page_image'] = q.page_image_ref
     return base
 
 
@@ -283,6 +303,68 @@ def delete_question(question_id):
         return jsonify({'success': False, 'error': '删除失败，请稍后重试'}), 500
 
 
+@bp.route('/questions/batch-delete', methods=['POST'])
+def batch_delete_questions():
+    """
+    批量删除题目
+
+    Body参数:
+        ids: 题目 ID 列表
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_ids = data.get('ids')
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return jsonify({'success': False, 'error': '请选择要删除的题目'}), 400
+        try:
+            question_ids = [int(question_id) for question_id in raw_ids]
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': '题目 ID 格式错误'}), 400
+
+        with SessionLocal() as db:
+            deleted = crud.delete_questions(db, question_ids, user_id=_effective_user_id())
+
+        if deleted <= 0:
+            return jsonify({'success': False, 'error': '题目不存在'}), 404
+
+        return jsonify({
+            'success': True,
+            'deleted': deleted,
+            'message': f'已删除 {deleted} 道题目',
+        })
+
+    except Exception as e:
+        logger.exception("批量删除题目失败")
+        return jsonify({'success': False, 'error': '删除失败，请稍后重试'}), 500
+
+
+def _error_bank_filters():
+    """
+    解析错题库通用筛选参数
+
+    供错题库列表和「跨页全选」ID 接口复用；日期格式错误时抛出 ValueError。
+    """
+    start_date = None
+    end_date = None
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    if start_date_str:
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+    if end_date_str:
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+
+    return {
+        'subject': request.args.get('subject', type=str) or None,
+        'knowledge_tag': request.args.get('knowledge_tag', type=str) or None,
+        'question_type': request.args.get('question_type', type=str) or None,
+        'keyword': request.args.get('keyword', type=str) or None,
+        'review_status': request.args.get('review_status', type=str) or None,
+        'start_date': start_date,
+        'end_date': end_date,
+        'project_id': _project_id_arg(),
+    }
+
+
 @bp.route('/error-bank', methods=['GET'])
 def get_error_bank():
     """
@@ -301,36 +383,14 @@ def get_error_bank():
     try:
         page = max(1, request.args.get('page', 1, type=int))
         page_size = min(100, max(1, request.args.get('page_size', 20, type=int)))
-        subject = request.args.get('subject', type=str) or None
-        knowledge_tag = request.args.get('knowledge_tag', type=str) or None
-        question_type = request.args.get('question_type', type=str) or None
-        keyword = request.args.get('keyword', type=str) or None
-        review_status = request.args.get('review_status', type=str) or None
-        project_id = _project_id_arg()
-        start_date_str = request.args.get('start_date')
-        end_date_str = request.args.get('end_date')
-
-        start_date = None
-        end_date = None
-        if start_date_str:
-            start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-        if end_date_str:
-            end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
 
         with SessionLocal() as db:
             questions, total, grand_total = crud.query_questions(
-            db,
-            user_id=_effective_user_id(),
-                subject=subject,
-                knowledge_tag=knowledge_tag,
-                question_type=question_type,
-                keyword=keyword,
-                start_date=start_date,
-                end_date=end_date,
-                review_status=review_status,
+                db,
+                user_id=_effective_user_id(),
                 page=page,
                 page_size=page_size,
-                project_id=project_id,
+                **_error_bank_filters(),
             )
 
             total_pages = (total + page_size - 1) // page_size
@@ -351,6 +411,34 @@ def get_error_bank():
     except Exception as e:
         logger.exception("查询错题库失败")
         return jsonify({'success': False, 'error': '查询失败，请稍后重试'}), 500
+
+
+@bp.route('/error-bank/ids', methods=['GET'])
+def get_error_bank_ids():
+    """
+    获取当前筛选条件下的全部题目 ID
+
+    用于错题库「全选所有筛选结果」（跨页选择），Query 参数与 /error-bank 一致。
+    """
+    try:
+        with SessionLocal() as db:
+            ids = crud.query_question_ids(
+                db,
+                user_id=_effective_user_id(),
+                **_error_bank_filters(),
+            )
+
+        return jsonify({
+            'success': True,
+            'ids': ids,
+            'total': len(ids),
+        })
+
+    except ValueError:
+        return jsonify({'success': False, 'error': '日期格式错误，请使用 YYYY-MM-DD 格式'}), 400
+    except Exception as e:
+        logger.exception("获取错题库题目ID失败")
+        return jsonify({'success': False, 'error': '获取题目列表失败，请稍后重试'}), 500
 
 
 @bp.route('/error-bank/find', methods=['GET'])

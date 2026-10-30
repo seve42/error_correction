@@ -3,7 +3,9 @@
  * UploadStage.vue
  * 工作台第一页：上传与分析（模式切换 + 流程步骤 + 文件上传）
  */
+import { computed } from 'vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import StatusBar from '@/components/features/app/workspace/StatusBar.vue'
 import FileUploader from '@/components/features/app/workspace/FileUploader.vue'
 import FileList from '@/components/features/app/workspace/FileList.vue'
@@ -12,6 +14,8 @@ import ActionBar from '@/components/features/app/workspace/ActionBar.vue'
 const props = defineProps({
   uploadMode: String,
   workflowMode: { type: String, default: 'manual' },
+  // 生成标准答案解析：导入流程开始前决定，作为分割后的独立一步执行
+  autoGenerateAnswers: { type: Boolean, default: true },
   // StatusBar
   statusLoading: Boolean,
   statusError: [String, null],
@@ -27,6 +31,10 @@ const props = defineProps({
   waitingKeys: Object,
   uploadBusy: Boolean,
   uploadReady: Boolean,
+  // 聚合上传进度：几百张图分批并发时，用户需要看到"传到第几个/总进度"
+  uploadPercent: Number,
+  uploadDone: Number,
+  uploadTotal: Number,
   // ActionBar
   splitEnabled: Boolean,
 })
@@ -34,6 +42,7 @@ const props = defineProps({
 const emit = defineEmits([
   'update:upload-mode',
   'update:workflow-mode',
+  'update:auto-generate-answers',
   'update:selected-llm-option-id',
   'upload',
   'remove-file',
@@ -50,6 +59,25 @@ const workflowModeOptions = [
   { value: 'manual', label: '流程模式', icon: 'fa-list-check' },
   { value: 'auto', label: '自动模式', icon: 'fa-bolt' },
 ]
+
+// 流程步骤卡片：试卷模式把「生成解析」单独列一步，与左侧步骤条一致。
+const flowSteps = computed(() => {
+  if (props.uploadMode === 'note') {
+    return [
+      { icon: 'fa-cloud-arrow-up', label: '上传笔记' },
+      { icon: 'fa-eye', label: 'AI 识别' },
+      { icon: 'fa-wand-magic-sparkles', label: '智能整理' },
+      { icon: 'fa-bookmark', label: '保存笔记' },
+    ]
+  }
+  return [
+    { icon: 'fa-cloud-arrow-up', label: '上传文件' },
+    { icon: 'fa-eye', label: 'AI 识别' },
+    { icon: 'fa-scissors', label: '分割纠错' },
+    { icon: 'fa-lightbulb', label: '生成解析' },
+    { icon: 'fa-file-export', label: '导出归档' },
+  ]
+})
 </script>
 
 <template>
@@ -69,6 +97,13 @@ const workflowModeOptions = [
       :options="workflowModeOptions"
       @update:model-value="(value) => emit('update:workflow-mode', value)"
     />
+
+    <!-- 生成解析：仅试卷模式，默认开启，导入流程开始时即确定 -->
+    <BaseCheckbox v-if="uploadMode !== 'note'" class="ml-1"
+      :model-value="autoGenerateAnswers"
+      label="生成标准答案解析"
+      description="分割完成后自动为全部题目生成标准答案与解析"
+      @update:model-value="(value) => emit('update:auto-generate-answers', value)" />
 
     <!-- 引擎状态 -->
     <div class="ml-auto">
@@ -97,38 +132,22 @@ const workflowModeOptions = [
     </div>
 
     <!-- 流程步骤卡片 -->
-    <div class="grid w-full max-w-2xl grid-cols-4 gap-4 transition-colors">
-      <div class="flex flex-col items-center gap-3 rounded-lg brand-btn p-4 text-center">
+    <div class="grid w-full max-w-2xl gap-4 transition-colors"
+      :class="uploadMode === 'note' ? 'grid-cols-4' : 'grid-cols-5'">
+      <div v-for="item in flowSteps" :key="item.label"
+        class="flex flex-col items-center gap-3 rounded-lg brand-btn p-4 text-center">
         <div class="flex h-12 w-12 items-center justify-center rounded-lg bg-gray-100 dark:bg-white/[0.04]">
-          <i class="fa-solid fa-cloud-arrow-up text-xl accent-text"></i>
+          <i class="fa-solid text-xl accent-text" :class="item.icon"></i>
         </div>
-        <span class="text-sm text-gray-500 dark:text-[#8a8f98]">{{ uploadMode === 'note' ? '上传笔记' : '上传文件' }}</span>
-      </div>
-      <div class="flex flex-col items-center gap-3 rounded-lg brand-btn p-4 text-center">
-        <div class="flex h-12 w-12 items-center justify-center rounded-lg bg-gray-100 dark:bg-white/[0.04]">
-          <i class="fa-solid fa-eye text-xl accent-text"></i>
-        </div>
-        <span class="text-sm text-gray-500 dark:text-[#8a8f98]">AI 识别</span>
-      </div>
-      <div class="flex flex-col items-center gap-3 rounded-lg brand-btn p-4 text-center">
-        <div class="flex h-12 w-12 items-center justify-center rounded-lg bg-gray-100 dark:bg-white/[0.04]">
-          <i class="fa-solid text-xl accent-text"
-            :class="uploadMode === 'note' ? 'fa-wand-magic-sparkles' : 'fa-scissors'"></i>
-        </div>
-        <span class="text-sm text-gray-500 dark:text-[#8a8f98]">{{ uploadMode === 'note' ? '智能整理' : '分割纠错' }}</span>
-      </div>
-      <div class="flex flex-col items-center gap-3 rounded-lg brand-btn p-4 text-center">
-        <div class="flex h-12 w-12 items-center justify-center rounded-lg bg-gray-100 dark:bg-white/[0.04]">
-          <i class="fa-solid text-xl accent-text"
-            :class="uploadMode === 'note' ? 'fa-bookmark' : 'fa-file-export'"></i>
-        </div>
-        <span class="text-sm text-gray-500 dark:text-[#8a8f98]">{{ uploadMode === 'note' ? '保存笔记' : '导出归档' }}</span>
+        <span class="text-sm text-gray-500 dark:text-[#8a8f98]">{{ item.label }}</span>
       </div>
     </div>
 
     <!-- 拖拽上传 -->
     <FileUploader :pending-files="pendingFiles" :file-progress="fileProgress" :waiting-keys="waitingKeys"
-      :upload-busy="uploadBusy" :upload-ready="uploadReady" :splitting="splitting" :split-completed="splitCompleted"
+      :upload-busy="uploadBusy" :upload-ready="uploadReady" :upload-percent="uploadPercent"
+      :upload-done="uploadDone" :upload-total="uploadTotal"
+      :splitting="splitting" :split-completed="splitCompleted"
       :expand="false" :disabled="!hasConfiguredModel"
       :model-options-data="modelOptionsData" :selected-llm-option-id="selectedLlmOptionId"
       :status-loading="statusLoading" :no-models="!hasConfiguredModel"
@@ -139,6 +158,7 @@ const workflowModeOptions = [
     <!-- 已上传文件 -->
     <FileList class="w-full max-w-2xl" :pending-files="pendingFiles" :file-progress="fileProgress"
       :waiting-keys="waitingKeys" :upload-busy="uploadBusy" :upload-ready="uploadReady" :splitting="splitting"
+      :upload-percent="uploadPercent" :upload-done="uploadDone" :upload-total="uploadTotal"
       :split-completed="splitCompleted" @remove-file="(f) => emit('remove-file', f)" />
 
     <!-- 操作按钮 -->

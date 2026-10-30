@@ -3,8 +3,10 @@
  * SplitHistoryView.vue
  * 分割历史页面，展示历史分割记录，并支持把历史题目重新载入工作台。
  */
-import { ref, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import * as api from '@/api/index'
+import BatchSelectBar from '@/components/features/app/shared/BatchSelectBar.vue'
+import { useBatchSelection } from '@/composables/useBatchSelection'
 import { getQuestionSnippet, typesetMath as _typesetMath } from '@/utils/index'
 
 const props = defineProps({
@@ -22,7 +24,17 @@ const detailLoading = ref(false)
 // ---- 详情面板 ----
 const activeRecord = ref(null)
 const activeQuestions = ref([])
-const selectedIds = ref(new Set())
+const { selectedIds, toggleSelect, selectIds, clearSelection } = useBatchSelection()
+
+/** 当前历史记录题目是否已全部选中。 */
+const allQuestionsSelected = computed(
+  () => activeQuestions.value.length > 0 && activeQuestions.value.every((q) => selectedIds.has(q.uid)),
+)
+
+const toggleSelectAllQuestions = () => {
+  if (allQuestionsSelected.value) clearSelection()
+  else selectIds(activeQuestions.value.map((q) => q.uid))
+}
 
 /**
  * 加载最近的分割历史记录。
@@ -49,7 +61,7 @@ const openDetail = async (record) => {
   detailLoading.value = true
   activeRecord.value = record
   activeQuestions.value = []
-  selectedIds.value = new Set()
+  clearSelection()
   try {
     const detail = await api.fetchSplitRecordDetail(record.id)
     // 兼容旧历史记录（无 uid）：按索引补齐
@@ -70,22 +82,7 @@ const openDetail = async (record) => {
 const closeDetail = () => {
   activeRecord.value = null
   activeQuestions.value = []
-  selectedIds.value = new Set()
-}
-
-const toggleSelect = (qid) => {
-  const s = new Set(selectedIds.value)
-  if (s.has(qid)) s.delete(qid)
-  else s.add(qid)
-  selectedIds.value = s
-}
-
-const selectAllQuestions = () => {
-  selectedIds.value = new Set(activeQuestions.value.map(q => q.uid))
-}
-
-const deselectAllQuestions = () => {
-  selectedIds.value = new Set()
+  clearSelection()
 }
 
 /**
@@ -93,8 +90,8 @@ const deselectAllQuestions = () => {
  */
 const loadToWorkspace = () => {
   if (!activeQuestions.value.length) return
-  const qs = selectedIds.value.size > 0
-    ? activeQuestions.value.filter(q => selectedIds.value.has(q.uid))
+  const qs = selectedIds.size > 0
+    ? activeQuestions.value.filter(q => selectedIds.has(q.uid))
     : activeQuestions.value
   emit('load-record', qs, activeRecord.value)
 }
@@ -244,24 +241,24 @@ defineExpose({ refresh: loadRecords })
                 <div v-else class="split-history-questions">
                   <!-- 工具栏 -->
                   <div class="border-b border-slate-200/40 dark:border-white/5">
-                    <div class="flex items-center gap-2 py-2">
-                      <button
-                        v-if="selectedIds.size > 0"
-                        @click.stop="deselectAllQuestions"
-                        class="shrink-0 rounded-lg border border-slate-200/60 bg-white/60 px-3 py-2 text-xs font-bold text-slate-500 transition-all hover:bg-white dark:border-white/10 dark:bg-white/5 dark:text-slate-400 dark:hover:bg-white/10"
-                      >取消</button>
-                      <button
-                        v-else
-                        @click.stop="selectAllQuestions"
-                        class="shrink-0 rounded-lg border border-slate-200/60 bg-white/60 px-3 py-2 text-xs font-bold text-slate-600 transition-all hover:bg-white dark:border-white/10 dark:bg-white/5 dark:text-slate-300 dark:hover:bg-white/10"
-                      >全选</button>
-                    <button
-                      @click.stop="loadToWorkspace"
-                      class="inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-lg accent-bg px-3 py-2 text-xs font-bold text-white shadow-sm transition-all hover:shadow-md"
-                    >
-                      <i class="fa-solid fa-arrow-right-to-bracket"></i>
-                      <span class="truncate">{{ selectedIds.size > 0 ? `加载选中 ${selectedIds.size}` : '全部加载' }}</span>
-                    </button>
+                    <div class="py-2">
+                      <BatchSelectBar
+                        :selected-count="selectedIds.size"
+                        :total-count="activeQuestions.length"
+                        :all-selected="allQuestionsSelected"
+                        @toggle-all="toggleSelectAllQuestions"
+                        @clear="clearSelection"
+                      >
+                        <template #actions>
+                          <button
+                            @click.stop="loadToWorkspace"
+                            class="inline-flex min-w-0 items-center justify-center gap-2 rounded-lg accent-bg px-3 py-2 text-xs font-bold text-white shadow-sm transition-all hover:shadow-md"
+                          >
+                            <i class="fa-solid fa-arrow-right-to-bracket"></i>
+                            <span class="truncate">{{ selectedIds.size > 0 ? `加载选中 ${selectedIds.size}` : '全部加载' }}</span>
+                          </button>
+                        </template>
+                      </BatchSelectBar>
                     </div>
                   </div>
 

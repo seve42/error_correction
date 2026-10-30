@@ -47,6 +47,13 @@ const optionImages = computed(() => {
   return null
 })
 
+// 题目页面原图：跨页题目保留多张，优先 page_images，兼容旧数据的 page_image
+const pageImages = computed(() => {
+  const list = props.question.page_images
+  if (Array.isArray(list) && list.length) return list
+  return props.question.page_image ? [props.question.page_image] : []
+})
+
 // 本地答案编辑状态（工作台内存保存，入库时随 question 对象一同传递）
 const editingAnswer = ref(false)
 const editingUserAnswer = ref(false)
@@ -172,16 +179,18 @@ const blankVerdictLabel = (verdict) => verdictMeta[String(verdict || '')]?.label
         </div>
       </div>
 
-      <!-- 整页原图：视觉 OCR 时保留原始页面，便于核对裁剪区域 -->
-      <div v-if="question.page_image" class="mt-8">
+      <!-- 题目原图：视觉 OCR 识别时保留的整页图片，跨页题目会有两张 -->
+      <div v-if="pageImages.length" class="mt-8">
         <div
           class="mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">
           <i class="fa-regular fa-image"></i>
-          <span>整页原图</span>
+          <span>题目原图<span v-if="pageImages.length > 1">（{{ pageImages.length }} 页）</span></span>
         </div>
-        <img :src="question.page_image"
-          class="max-h-[240px] max-w-full cursor-zoom-in rounded-xl border border-gray-100 object-contain shadow-sm transition-transform hover:scale-[1.01] dark:border-white/5"
-          @click.stop="() => emit('open-image', question.page_image)" />
+        <div class="flex flex-wrap gap-3">
+          <img v-for="(src, index) in pageImages" :key="'page-' + index" :src="src"
+            class="max-h-[240px] max-w-full cursor-zoom-in rounded-xl border border-gray-100 object-contain shadow-sm transition-transform hover:scale-[1.01] dark:border-white/5"
+            @click.stop="() => emit('open-image', src)" />
+        </div>
       </div>
 
       <!-- 我的答案：视觉 OCR 汇总的黑/蓝笔作答，旧题没有该字段时隐藏 -->

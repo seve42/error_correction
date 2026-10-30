@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import * as api from '@/api/index'
 import { useAuth } from '@/composables/useAuth'
 import { useProjects } from '@/composables/useProjects'
+import { useTaskProgress } from '@/composables/useTaskProgress'
 import { buildGeneratedAnswerQuestion, composeAnswerWithReasoning } from '@/utils/index'
 import type { NotePreview } from '@/types/domain'
 
@@ -11,7 +12,7 @@ const QUOTA_EXCEEDED_CODE = 'DAILY_FREE_QUOTA_EXCEEDED'
  * useSplitPipeline.js
  * 串联“视觉 OCR、AI 分割、笔记整理、导出、入库”的工作台主流程。
  */
-export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, splitting, splitCompleted, uploadMode, selectedLlmOption, questions, selectedIds, pendingFiles, typesetMath) {
+export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, splitting, splitCompleted, uploadMode, selectedLlmOption, questions, selectedIds, pendingFiles, typesetMath, autoGenerateAnswers) {
   const { setQuotaSnapshot, refreshCurrentUser } = useAuth()
   const { activeQuestionProjectId, loadProjects } = useProjects()
   const ocrLoading = ref(false)
@@ -21,6 +22,10 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
   const currentRunId = ref(null)
   const currentSplitRecordId = ref(null)
   const autoProcessing = ref(false)
+  // 生成标准答案解析是导入流程的独立一步，用自己的 loading 与分割阶段区分。
+  const answering = ref(false)
+  // 识别与分割共用同一份任务日志；自动模式下 split 复用 OCR 的 taskId 续接事件。
+  const progress = useTaskProgress()
 
   const setLoadedSplitRecord = (record) => {
     currentRunId.value = record?.run_id || null
@@ -62,8 +67,10 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
     notePreview.value = null
     currentView.value = 'workspace_review'
     step.value = S.value.OCR
+    // 先建任务再发请求：后端允许先订阅后执行，事件不会因为请求晚到而丢失。
+    const taskId = progress.start()
     try {
-      const data = await api.runOcr('vision')
+      const data = await api.runOcr('vision', taskId)
       ocrPages.value = data.pages || []
       ocrDone.value = true
       await refreshQuotaSnapshot()
@@ -80,13 +87,88 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
       return false
     } finally {
       ocrLoading.value = false
+      // HTTP 响应早于 SSE 尾部几十毫秒：先等 done/最后几条事件落地（最多 2s）再断流，
+      // 否则日志会缺最后一条汇总事件；拿不到流时立即返回，不拖慢流程。
+      await progress.waitForDone()
+      // 自动模式下紧接着要分割，这里只关流不清日志，doSplit 会用 lastSeq 重连。
+      progress.close()
+    }
+  }
+
+  /**
+   * 为全部已分割题目生成标准答案与解析（导入流程独立一步）。
+   * keepTask 为 true 时续接分割阶段的同一 taskId，日志与进度条接着往下滚动；
+   * 生成失败不阻断后续导入，用户仍可先核对题目再手动补生成。
+   */
+  const doGenerateAnswers = async (options: { keepTask?: boolean } = {}) => {
+    if (!autoGenerateAnswers?.value) return true
+    const targets = questions.value.slice()
+    if (!targets.length) return true
+
+    const option = selectedLlmOption?.value
+    if (!option?.category || !option?.model_name) {
+      pushToast('error', '请先在顶部选择一个可用模型')
+      return false
+    }
+
+    answering.value = true
+    step.value = S.value.ANSWER
+    if (options?.keepTask && progress.taskId.value) {
+      // 自动模式/流程模式都是同一份日志：按上一阶段的 seq 续连，新阶段事件接着追加。
+      progress.connect(progress.lastSeq.value, { expectRestart: true })
+    } else {
+      progress.start()
+    }
+    try {
+      const payloads = targets.map(q => buildGeneratedAnswerQuestion(q))
+      const results = await api.generateAnswers(payloads, {
+        modelProvider: option.category,
+        modelName: option.model_name,
+        providerSource: option.source,
+        providerId: option.provider_id,
+        taskId: progress.taskId.value,
+      })
+      // 后端保证结果顺序与请求一致，按索引回填
+      let filled = 0
+      targets.forEach((q, index) => {
+        const result = results[index]
+        if (!result) return
+        const text = composeAnswerWithReasoning(result.answer, result.reasoning)
+        if (!text) return
+        q.answer = text
+        filled += 1
+      })
+      if (!filled) {
+        pushToast('error', 'AI 未返回有效答案，请稍后重试')
+        return false
+      }
+      if (filled < targets.length) {
+        pushToast('success', `已生成 ${filled} 道题的标准答案解析，${targets.length - filled} 道题未生成`)
+      } else {
+        pushToast('success', `已生成 ${filled} 道题的标准答案解析`)
+      }
+      if (typeof typesetMath === 'function') await typesetMath()
+      return true
+    } catch (e) {
+      if (syncQuotaFromError(e)) {
+        pushToast('error', e.message || '今日免费体验次数已用完')
+      } else {
+        pushToast('error', '生成标准答案解析失败: ' + (e instanceof Error ? e.message : String(e)))
+      }
+      return false
+    } finally {
+      answering.value = false
+      // 等解答阶段最后几条事件落地再断流，核对页回看时日志才完整。
+      await progress.waitForDone()
+      progress.close()
     }
   }
 
   /**
    * 根据上传模式分流：错题模式执行 AI 分割，笔记模式执行笔记整理。
+   * keepTask 为 true 时续用 doOcr 已建的任务（自动模式），否则新建一份只包含分割阶段的日志。
    */
-  const doSplit = async () => {
+  const doSplit = async (options: { keepTask?: boolean } = {}) => {
     if (!uploadReady.value || splitting.value || splitCompleted.value) return false
 
     if (uploadMode.value === 'note') {
@@ -98,6 +180,13 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
     currentSplitRecordId.value = null
     ocrDone.value = false
     step.value = S.value.SPLIT
+    if (options?.keepTask && progress.taskId.value) {
+      // 自动模式：OCR 已结束并关流，按最后一条 seq 重连，日志继续追加而不是清空。
+      // expectRestart 让轮询兜底忽略 POST 到达前的「已完成」快照，等后端 restart 后继续收事件。
+      progress.connect(progress.lastSeq.value, { expectRestart: true })
+    } else {
+      progress.start()
+    }
     pushToast('info', '正在调用AI分割题目，请稍候...', 1800)
     try {
       const data = await api.splitQuestions(
@@ -106,6 +195,7 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
         selectedLlmOption.value?.source || '',
         selectedLlmOption.value?.provider_id || '',
         'vision',
+        progress.taskId.value,
       )
       currentRunId.value = data.run_id || null
       currentSplitRecordId.value = null
@@ -116,10 +206,14 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
       }
       if (questions.value.length > 0) {
         splitCompleted.value = true
-        step.value = S.value.EXPORT
         if (!data.warnings || !data.warnings.length) {
           pushToast('success', `成功分割 ${questions.value.length} 道题目`)
         }
+        // 先收完分割阶段的 done 再续连：否则新流会重放旧的 done，浏览器提前关流，解答阶段日志全丢。
+        await progress.waitForDone()
+        // 分割完成后按上传页的选项继续生成标准答案解析（独立一步，日志续接同一 taskId）。
+        await doGenerateAnswers({ keepTask: true })
+        step.value = S.value.EXPORT
         await typesetMath()
         await refreshQuotaSnapshot()
         setTimeout(() => {
@@ -139,6 +233,10 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
       return false
     } finally {
       splitting.value = false
+      // 等分割阶段的 done/尾部事件到达再断流，ReviewStage 回看时日志才完整。
+      await progress.waitForDone()
+      // 成功后保留事件供 ReviewStage 回看，只停止运行态与订阅。
+      progress.close()
     }
   }
 
@@ -157,7 +255,8 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
       const ocrOk = await doOcr()
       if (!ocrOk) return
 
-      await doSplit()
+      // 两阶段复用同一 taskId：分割事件接着 OCR 的 seq 继续推送，日志不丢。
+      await doSplit({ keepTask: true })
     } finally {
       autoProcessing.value = false
     }
@@ -275,53 +374,6 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
   }
 
   /**
-   * 为已选中的题目批量生成标准答案与解析，写回本地题目（answer 字段）。
-   * 导入错题库前按需调用；生成结果会随 doSaveToDb 的 answers 一并入库。
-   */
-  const generateSelectedAnswers = async () => {
-    const targets = questions.value.filter(q => selectedIds.has(q.uid))
-    if (!targets.length) { pushToast('error', '请至少选择一道题目！'); return false }
-    const option = selectedLlmOption?.value
-    if (!option?.category || !option?.model_name) {
-      pushToast('error', '请先在顶部选择一个可用模型')
-      return false
-    }
-    try {
-      const payloads = targets.map(q => buildGeneratedAnswerQuestion(q))
-      const results = await api.generateAnswers(payloads, {
-        modelProvider: option.category,
-        modelName: option.model_name,
-        providerSource: option.source,
-        providerId: option.provider_id,
-      })
-      // 后端保证结果顺序与请求一致，按索引回填
-      let filled = 0
-      targets.forEach((q, index) => {
-        const result = results[index]
-        if (!result) return
-        const text = composeAnswerWithReasoning(result.answer, result.reasoning)
-        if (!text) return
-        q.answer = text
-        filled += 1
-      })
-      if (!filled) {
-        pushToast('error', 'AI 未返回有效答案，请稍后重试')
-        return false
-      }
-      if (filled < targets.length) {
-        pushToast('success', `已生成 ${filled} 道题的标准答案解析，${targets.length - filled} 道题未生成`)
-      } else {
-        pushToast('success', `已生成 ${filled} 道题的标准答案解析`)
-      }
-      if (typeof typesetMath === 'function') await typesetMath()
-      return true
-    } catch (e) {
-      pushToast('error', '生成标准答案解析失败: ' + (e instanceof Error ? e.message : String(e)))
-      return false
-    }
-  }
-
-  /**
    * 把选中的错题保存到当前错题库，并刷新错题库页面。
    */
   const doSaveToDb = async (targetProjectId, errorBankRef) => {
@@ -344,8 +396,8 @@ export function useSplitPipeline(pushToast, currentView, step, S, uploadReady, s
   }
 
   return {
-    ocrLoading, ocrPages, ocrDone, notePreview, autoProcessing,
-    startProcess, runAutoProcess, doOcr, doSplit, doExport, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
-    generateSelectedAnswers,
+    ocrLoading, ocrPages, ocrDone, notePreview, autoProcessing, answering,
+    progress,
+    startProcess, runAutoProcess, doOcr, doSplit, doGenerateAnswers, doExport, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
   }
 }

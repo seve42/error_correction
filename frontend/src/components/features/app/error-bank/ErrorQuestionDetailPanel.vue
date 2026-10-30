@@ -43,6 +43,12 @@ const { selectedLlmOption } = useSystemStatus()
 const { pushToast } = useToast()
 const generatingAnswer = ref(false)
 const hasAnswer = computed(() => Boolean(String(props.question?.answer || '').trim()))
+// 题目页面原图：跨页题目保留多张，优先 page_images，兼容旧数据的 page_image
+const pageImages = computed(() => {
+  const list = props.question?.page_images
+  if (Array.isArray(list) && list.length) return list
+  return props.question?.page_image ? [props.question.page_image] : []
+})
 const modelReady = computed(() => Boolean(selectedLlmOption.value?.category && selectedLlmOption.value?.model_name))
 const generateHint = computed(() => (modelReady.value ? '' : '请先在设置中选择模型'))
 
@@ -138,17 +144,21 @@ const generateAnswer = async () => {
             </div>
           </div>
 
-          <!-- 整页原图：视觉 OCR 时保留原始页面，便于核对裁剪区域 -->
-          <div v-if="question.page_image" class="space-y-2">
+          <!-- 题目原图：视觉 OCR 识别时保留的整页图片，跨页题目会有两张 -->
+          <div v-if="pageImages.length" class="space-y-2">
             <div class="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-gray-400 dark:text-[#8a8f98]">
               <i class="fa-regular fa-image"></i>
-              <span>整页原图</span>
+              <span>题目原图<span v-if="pageImages.length > 1">（{{ pageImages.length }} 页）</span></span>
             </div>
-            <img
-              :src="question.page_image"
-              class="max-h-56 max-w-full cursor-zoom-in rounded-xl border border-gray-200 object-contain shadow-sm shadow-black/[0.04] dark:border-white/10 dark:shadow-black/20"
-              @click="emit('open-image', question.page_image)"
-            />
+            <div class="flex flex-wrap gap-3">
+              <img
+                v-for="(src, index) in pageImages"
+                :key="'page-' + index"
+                :src="src"
+                class="max-h-56 max-w-full cursor-zoom-in rounded-xl border border-gray-200 object-contain shadow-sm shadow-black/[0.04] dark:border-white/10 dark:shadow-black/20"
+                @click="emit('open-image', src)"
+              />
+            </div>
           </div>
 
           <div class="rounded-xl bg-white/75 shadow-sm shadow-black/[0.03] dark:bg-white/[0.035] dark:shadow-black/20">

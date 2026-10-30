@@ -67,7 +67,7 @@ def organize_question_images(questions: List[Dict[str, Any]]) -> None:
     """入库前把题目图片复制到持久目录，并把引用重写为 /api/question-image/...。
 
     幂等：已指向 /api/question-image/ 的引用不做处理；解析不到真实文件时保留原引用。
-    重写范围：image content_block 的 content、image_refs、page_image。
+    重写范围：image content_block 的 content、image_refs、page_images/page_image。
     """
     root = str(settings.question_images_dir)
     for question in questions or []:
@@ -108,7 +108,14 @@ def organize_question_images(questions: List[Dict[str, Any]]) -> None:
                 if new_ref and new_ref not in rewritten:
                     rewritten.append(new_ref)
             question["image_refs"] = rewritten or None
-        if question.get("page_image"):
+        page_images = question.get("page_images")
+        if isinstance(page_images, list):
+            persisted_pages = [p for p in (_persist(ref) for ref in page_images) if p]
+            question["page_images"] = persisted_pages or None
+            page_images = question["page_images"]
+        if page_images:
+            question["page_image"] = page_images[0]
+        elif question.get("page_image"):
             question["page_image"] = _persist(question.get("page_image"))
         if has_image_block:
             question["has_image"] = True

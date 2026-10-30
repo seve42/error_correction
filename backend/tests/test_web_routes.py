@@ -687,6 +687,66 @@ class TestDeleteQuestionRoute:
         assert resp.get_json()["success"] is True
 
 
+# ── POST /api/questions/batch-delete ───────────────────
+
+
+class TestBatchDeleteQuestionsRoute:
+    """POST /api/questions/batch-delete"""
+
+    def _seed_questions(self, test_db, count=2):
+        from db.crud import save_questions_to_db
+        from db.models import Question
+
+        questions = [
+            {
+                "question_id": str(index + 1),
+                "question_type": "选择题",
+                "content_blocks": [{"block_type": "text", "content": f"批量删除测试题目{index}"}],
+                "has_formula": False,
+                "has_image": False,
+            }
+            for index in range(count)
+        ]
+        save_questions_to_db(
+            test_db,
+            questions,
+            {
+                "original_filename": "batch-test.pdf",
+                "subject": "数学",
+            },
+            user_id=TEST_USER_ID,
+        )
+        return [question.id for question in test_db.query(Question).all()]
+
+    def test_empty_ids(self, client):
+        resp = client.post("/api/questions/batch-delete", json={"ids": []})
+        assert resp.status_code == 400
+        assert resp.get_json()["success"] is False
+
+    def test_delete_existing(self, client, test_db):
+        question_ids = self._seed_questions(test_db)
+
+        resp = client.post("/api/questions/batch-delete", json={"ids": question_ids})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["success"] is True
+        assert data["deleted"] == len(question_ids)
+
+        from db.models import Question
+
+        assert test_db.query(Question).count() == 0
+
+    def test_ids_endpoint_returns_all_filtered_ids(self, client, test_db):
+        question_ids = self._seed_questions(test_db)
+
+        resp = client.get("/api/error-bank/ids?subject=数学")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["success"] is True
+        assert data["total"] == len(question_ids)
+        assert set(data["ids"]) == set(question_ids)
+
+
 # ── /api/error-bank ────────────────────────────────────
 
 

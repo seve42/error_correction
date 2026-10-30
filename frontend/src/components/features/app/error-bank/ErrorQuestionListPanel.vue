@@ -10,6 +10,7 @@ import BasePanel from '@/components/base/BasePanel.vue'
 import BasePanelTitle from '@/components/base/BasePanelTitle.vue'
 import ErrorBankToolbar from '@/components/features/app/error-bank/ErrorBankToolbar.vue'
 import ErrorQuestionListItem from '@/components/features/app/error-bank/ErrorQuestionListItem.vue'
+import BatchSelectBar from '@/components/features/app/shared/BatchSelectBar.vue'
 
 defineProps({
   filters: { type: Object, required: true },
@@ -24,13 +25,18 @@ defineProps({
   totalPages: { type: Number, default: 0 },
   loading: { type: Boolean, default: false },
   activeQuestionId: { type: [String, Number, null], default: null },
-  selectMode: { type: Boolean, default: false },
+  selectedCount: { type: Number, default: 0 },
+  allSelected: { type: Boolean, default: false },
+  selecting: { type: Boolean, default: false },
   selectedIds: { type: Object, required: true },
   hasQuestionProject: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
-  'toggle-select-mode',
+  'toggle-select-all',
+  'clear-selection',
+  'batch-delete',
+  'export-selected',
   'create-question',
   'question-click',
   'toggle-select',
@@ -59,6 +65,25 @@ const isActiveQuestion = (question, activeQuestionId) => String(question?.id) ==
         class="mb-4"
       />
 
+      <BatchSelectBar
+        class="mb-3"
+        :selected-count="selectedCount"
+        :total-count="total"
+        :all-selected="allSelected"
+        :loading="selecting"
+        @toggle-all="emit('toggle-select-all')"
+        @clear="emit('clear-selection')"
+      >
+        <template #actions>
+          <BaseButton variant="primary" size="sm" :disabled="!selectedCount" @click="emit('export-selected')">
+            <i class="fa-solid fa-file-export"></i> 生成复习卷
+          </BaseButton>
+          <BaseButton variant="danger" size="sm" :disabled="!selectedCount" @click="emit('batch-delete')">
+            <i class="fa-solid fa-trash"></i> 删除选中
+          </BaseButton>
+        </template>
+      </BatchSelectBar>
+
       <p class="mb-3 text-xs text-gray-500 dark:text-[#8a8f98]">共 {{ total }} 题，当前第 {{ page }} 页</p>
 
       <div v-if="loading && !items.length" class="space-y-3">
@@ -83,7 +108,6 @@ const isActiveQuestion = (question, activeQuestionId) => String(question?.id) ==
           :question="question"
           :index="idx + 1 + (page - 1) * pageSize"
           :active="isActiveQuestion(question, activeQuestionId)"
-          :select-mode="selectMode"
           :selected="selectedIds.has(question.id)"
           @click="emit('question-click', question)"
           @toggle-select="(id) => emit('toggle-select', id)"

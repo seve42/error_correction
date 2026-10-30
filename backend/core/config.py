@@ -231,6 +231,12 @@ class Settings(BaseSettings):
     trust_env: bool = (
         True  # 是否信任系统代理环境变量，Windows 下设为 False 可解 WinError 10054
     )
+    # 视觉识别并发批次数：每批最多 6 页，几百页试卷靠并发把分钟级等待压下来。
+    # 调大能继续提速，但会同步放大带宽与模型并发额度占用，默认 4 路。
+    vision_concurrency: int = 4
+    # 生成标准答案解析的并发批次数：每批 4 道题，题量多时靠并发减少等待。
+    # 与视觉识别分开配置，便于单独控制解析阶段的模型并发压力，默认 3 路。
+    answer_concurrency: int = 3
 
     # 注册验证码邮件（SMTP，环境变量前缀仍为 APP_，如 APP_SMTP_HOST）
     smtp_host: str = ""

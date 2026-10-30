@@ -15,13 +15,17 @@ import logging
 import os
 import pathlib
 import shutil
+import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from typing import Any, Callable, Dict, List, Optional
 
 from PIL import Image, ImageOps
 
 from core.config import settings
+from core.task_progress import EventEmitter, build_ai_call_detail
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,10 @@ SPLIT_MAX_SIDE = 2000
 SPLIT_PIXEL_THRESHOLD = 5_500_000
 SPLIT_SIDE_THRESHOLD = 2800
 SCHEMA_VERSION = 2
+# 单次调用输出上限：一页内容丰富的试卷，完整 JSON（结构化数组 + tagged_text 转写）
+# 实测可达 1~2 万 token；原先的 16000 会在长试卷上被截断成半截 JSON，解析失败后
+# 只能整批重调一次，白白多花几十秒。deepseek-flash 实测接受 32k，留出余量。
+MAX_OUTPUT_TOKENS = 32000
 
 SYSTEM_PROMPT = r"""你是「试卷 OCR 与批改理解引擎」。输入是同一份试卷的连续页面（每页可能附原生分辨率分片）。
 你只输出一个 JSON 对象，不要输出解释、Markdown 代码块或多余文字。
@@ -49,14 +57,14 @@ SYSTEM_PROMPT = r"""你是「试卷 OCR 与批改理解引擎」。输入是同�
    常与黑/蓝笔重叠，必须逐区域扫描；画面一旦出现红笔，grading 或 handwriting(pen=red)
    中至少要有一条对应记录；确实没有红笔时这两处才为空。
 4. 红笔原文照抄（如 "-4"、"=1241"、"订正"、"✓"、"×"），不要翻译、不要推断。
-5. 题号以卷面为准；同一大题内题号唯一；除 figures 的 bbox 外不要输出坐标，不要编造位置。
+5. 题号以卷面为准；同一大题内题号唯一；不要输出任何坐标，不要编造位置。
 6. 先完整枚举红笔批改（本任务最关键的信息），再整理题目与黑/蓝笔作答，最后拼 tagged_text。
 7. 数学内容一律用 LaTeX：行内公式 $...$，独立成行公式 $$...$$；分数用 \frac{}{}，
    乘除号用 \times、\div，根号用 \sqrt，上下标用 ^、_，角度用 ^\circ。
    禁止输出 Unicode 数学符号（×、÷、≤、≥、√、≠、≈、° 等）和纯文本公式。
 8. 表格用 Markdown 表格或 HTML <table> 表示，禁止用空格/制表符对齐排版。
-9. 题目自带图形/几何图/统计图/电路图/表格时，在 figures 中给出裁剪范围，
-   供后续从页面图片中剪出配图；没有图形的题目不要输出 figures。
+9. 跨页题目合并成一道题，题号用卷面题号；在 page_indexes 中列出题目内容涉及的全部页
+   （通常 1 页；题目延续到下一页时两页都要列出）。
 
 二、输出两种表示
 A) tagged_text：按阅读顺序拼接的标记流：
@@ -70,17 +78,14 @@ B) 结构化数组：questions / handwriting / grading（见下）。
   "subject": "小学数学",
   "questions": [{
     "page_index": 0,
+    "page_indexes": [0],
     "qid": "1",
     "section": "一、填空",
     "type": "填空题",
     "text": "题干（公式用 LaTeX，表格用 Markdown/HTML）",
     "options": ["A. ...", "B. ..."],
     "score": "2",
-    "figures": [{
-      "bbox": [120, 340, 780, 620],
-      "role": "figure|table|chart|diagram",
-      "caption": "图注/表名（没有则留空）"
-    }],
+    "knowledge_tags": ["知识点", "知识点"],
     "blanks": [{
       "blank_id": "1-1",
       "printed_hint": "空附近的印刷文字",
@@ -110,19 +115,21 @@ B) 结构化数组：questions / handwriting / grading（见下）。
 }
 
 四、其他要求
-- page_index 从 0 开始，对应输入的“第 N 页”减 1。
+- page_index / page_indexes 从 0 开始，对应输入的“第 N 页”减 1。
 - 跨页题目合并成一道题，题号用卷面题号；分片之间重复内容只输出一次。
 - 试卷标题、页码、页眉页脚不要作为题目。
-- figures.bbox 是相对整页的 0-1000 归一化坐标 [x1, y1, x2, y2]，(x1,y1) 为左上、(x2,y2) 为右下；
-  必须完整包住图形本身（含坐标轴、标注、单位、图注），不要框进题干正文或整页；
-  一题多图按从左到右、从上到下顺序输出，同一张图不要重复；边界看不清时宁可略大也不要切掉内容。
+- page_index 是题目起始页；page_indexes 升序列出题目内容涉及的全部页，跨页时如 [0, 1]。
+- 每道题给出 1-3 个知识点标签 knowledge_tags：用二级知识点短语（4-8 个汉字），
+  同一知识点全卷统一写法；用户消息里给了已有知识点标签时，只有与本题确实匹配才复用，
+  不匹配就新造；不要输出同义重复标签，也不要把题型/科目当知识点。
 """
 
 USER_PROMPT = """下面给出试卷的 {page_count} 页（每页可能含 1 张整页图和若干原生分辨率分片）。
 请严格按系统提示输出 JSON：先逐条枚举红笔批改（勾/叉/半对/分数/扣分/订正/批注，一个不漏），
 再区分题干、黑/蓝笔手写与红笔批改；逐题给出每个空的作答与红笔判定；
 红笔批注照抄原文；整页用于把握题号和大题结构，分片用于精读；重复内容只输出一次。
-题目自带图形/表格时，用 figures 给出相对整页 0-1000 的 bbox 裁剪框；数学内容一律用 LaTeX。
+跨页题目合并为一道题，并在 page_indexes 中列出题目涉及的所有页；数学内容一律用 LaTeX。
+已有知识点标签（供复用，仅当与本题确实匹配时使用，不匹配就新造）：{existing_tags}
 """
 
 
@@ -215,63 +222,44 @@ def _question_richness(question: Dict[str, Any]) -> int:
     return score
 
 
-FIGURE_ROLES = {"figure", "table", "chart", "diagram"}
+def _normalize_page_indexes(value: Any, fallback: int, page_count: int) -> List[int]:
+    """把题目涉及的页归一化为升序、去重、合法的 0 基页码列表。
+
+    跨页题目会同时保留多张页面图，因此这里允许两个及以上页码。
+    """
+    indexes: List[int] = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            try:
+                indexes.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    if not indexes:
+        indexes = [fallback]
+    limit = max(page_count - 1, 0)
+    cleaned = {min(max(index, 0), limit) for index in indexes}
+    cleaned.add(min(max(fallback, 0), limit))
+    return sorted(cleaned)
 
 
-def _clean_figure_bbox(value: Any) -> Optional[List[int]]:
-    """把模型给出的 bbox 归一化为 0-1000 整数坐标，非法时返回 None。"""
-    if not isinstance(value, (list, tuple)) or len(value) != 4:
+def _merge_page_indexes(first: Any, second: Any) -> List[int]:
+    """合并同一题多次出现时收集到的页码。"""
+    merged = {int(item) for item in list(first or []) + list(second or []) if isinstance(item, int)}
+    return sorted(merged)
+
+
+def _normalize_knowledge_tags(value: Any) -> Optional[List[str]]:
+    """把知识点标签规整为去空、去重、最多 3 个；没有有效标签返回 None。"""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
         return None
-    coords = []
+    tags: List[str] = []
     for item in value:
-        try:
-            coords.append(float(item))
-        except (TypeError, ValueError):
-            return None
-    try:
-        x1, y1, x2, y2 = [min(max(int(round(c)), 0), 1000) for c in coords]
-    except (ValueError, OverflowError):  # NaN / inf
-        return None
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return [x1, y1, x2, y2]
-
-
-def clean_figures(value: Any) -> List[Dict[str, Any]]:
-    """清洗图形裁剪信息：保留 bbox/role/caption，丢弃非法 bbox 并按 bbox 去重。"""
-    figures: List[Dict[str, Any]] = []
-    seen = set()
-    if not isinstance(value, list):
-        return figures
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        bbox = _clean_figure_bbox(item.get("bbox"))
-        if bbox is None:
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        if role not in FIGURE_ROLES:
-            role = "figure"
-        caption = str(item.get("caption") or "").strip()
-        key = tuple(bbox)
-        if key in seen:
-            continue
-        seen.add(key)
-        figures.append({"bbox": bbox, "role": role, "caption": caption})
-    return figures
-
-
-def _merge_figures(first: Any, second: Any) -> List[Dict[str, Any]]:
-    """合并同一题多次出现时收集到的 figures，按 bbox 去重。"""
-    merged: List[Dict[str, Any]] = []
-    seen = set()
-    for figure in list(first or []) + list(second or []):
-        key = tuple(figure.get("bbox") or [])
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        merged.append(figure)
-    return merged
+        tag = str(item).strip() if item is not None else ""
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags[:3] or None
 
 
 def normalize_vision_result(raw: Dict[str, Any], page_count: int) -> List[Dict[str, Any]]:
@@ -302,8 +290,8 @@ def normalize_vision_result(raw: Dict[str, Any], page_count: int) -> List[Dict[s
         page_index = _page_index(q.get("page_index", q.get("page", 0)))
         section = _text(q.get("section")) or None
         question_type = _normalize_question_type(q.get("type"), options)
-        # 图形裁剪信息留给 workflow 裁图；此处只做清洗，非法 bbox 直接丢弃
-        figures = clean_figures(q.get("figures"))
+        # 跨页题目保留涉及的全部页，后续按页保存整页原图
+        page_indexes = _normalize_page_indexes(q.get("page_indexes"), page_index, page_count)
 
         blanks_raw = q.get("blanks") or []
         answers: List[str] = []
@@ -395,31 +383,31 @@ def normalize_vision_result(raw: Dict[str, Any], page_count: int) -> List[Dict[s
             "has_formula": "$" in text or "\\frac" in text,
             "has_image": False,
             "image_refs": None,
-            "knowledge_tags": None,
+            "knowledge_tags": _normalize_knowledge_tags(q.get("knowledge_tags")),
             "needs_correction": False,
             "ocr_issues": None,
             "student_answer": student_answer or None,
             "has_handwriting": bool(student_answer or black_marks),
             "grading": grading,
-            "figures": figures,
             "page_index": page_index,
+            "page_indexes": page_indexes,
             "_order": order,
         }
         questions.append(question)
 
-    # 同页同题号去重：保留内容更丰富的一份，位置不变；figures 取并集
+    # 同页同题号去重：保留内容更丰富的一份，位置不变；页码取并集
     deduped: List[Dict[str, Any]] = []
     index_by_key: Dict[tuple, int] = {}
     for question in questions:
         key = (question["page_index"], question["section_title"] or "", question["question_id"])
         if key in index_by_key:
             current = deduped[index_by_key[key]]
-            merged_figures = _merge_figures(current.get("figures"), question.get("figures"))
+            merged_pages = _merge_page_indexes(current.get("page_indexes"), question.get("page_indexes"))
             if _question_richness(question) > _question_richness(current):
-                question["figures"] = merged_figures
+                question["page_indexes"] = merged_pages
                 deduped[index_by_key[key]] = question
             else:
-                current["figures"] = merged_figures
+                current["page_indexes"] = merged_pages
             continue
         index_by_key[key] = len(deduped)
         deduped.append(question)
@@ -475,6 +463,79 @@ def _build_page_blocks(
     return blocks
 
 
+def _resolve_worker_count(max_workers: Optional[int], chunk_count: int) -> int:
+    """并发路数：显式参数 > settings.vision_concurrency，且不超过批次数。
+
+    批次数少于配置路数时不需要更多线程，避免空转线程和超发请求占用模型额度。
+    """
+    configured = max_workers if max_workers is not None else getattr(settings, "vision_concurrency", 1)
+    try:
+        configured = int(configured)
+    except (TypeError, ValueError):
+        configured = 1
+    return max(1, min(configured, max(chunk_count, 1)))
+
+
+class _BatchProgress:
+    """批次完成计数，保证并发下进度只增不减。
+
+    各批次完成顺序不固定，若直接用批次序号当进度，进度条会来回跳；这里统一
+    按“已完成批次数 / 总批次数”发进度。
+    """
+
+    def __init__(self, total: int):
+        self._total = max(total, 1)
+        self._done = 0
+        self._lock = threading.Lock()
+
+    def current(self) -> float:
+        with self._lock:
+            return self._done / self._total
+
+    def complete_next(self) -> float:
+        with self._lock:
+            self._done = min(self._total, self._done + 1)
+            return self._done / self._total
+
+
+class VisionOutputTruncated(RuntimeError):
+    """模型输出触达 max_tokens 上限，返回的 JSON 被截断（不能按普通错误重试）。"""
+
+
+def _page_range_label(metas: List[Dict[str, Any]]) -> str:
+    """把页面元信息转成“第 3 页 / 第 3-5 页”的中文标签（1 基，和界面一致）。"""
+    first = metas[0]["page_index"] + 1
+    last = metas[-1]["page_index"] + 1
+    return f"第 {first} 页" if first == last else f"第 {first}-{last} 页"
+
+
+def _merge_chunk_data(base: Optional[Dict[str, Any]], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """合并两段识别结果；拆分重试时保持与正常合并（按批顺序）一致。"""
+    merged = base or {"subject": "", "questions": [], "handwriting": [], "grading": [], "tagged_text": ""}
+    if not merged.get("subject"):
+        merged["subject"] = str(incoming.get("subject") or "").strip()
+    for key in ("questions", "handwriting", "grading"):
+        merged[key].extend(incoming.get(key) or [])
+    tagged = str(incoming.get("tagged_text") or "").strip()
+    if tagged:
+        existing = str(merged.get("tagged_text") or "").strip()
+        merged["tagged_text"] = f"{existing}\n\n{tagged}".strip() if existing else tagged
+    return merged
+
+
+def _accumulate_meta(target: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    """累加多次调用的元信息（拆批/精简重试后，一次批次可能对应多次模型调用）。"""
+    usage = meta.get("usage") or {}
+    total = target.setdefault("usage", {})
+    for key, value in usage.items():
+        if isinstance(value, (int, float)):
+            total[key] = (total.get(key) or 0) + value
+    target["duration"] = float(target.get("duration") or 0) + float(meta.get("duration") or 0)
+    target["attempt"] = int(target.get("attempt") or 0) + int(meta.get("attempt") or 1)
+    target["finish_reason"] = meta.get("finish_reason") or target.get("finish_reason") or ""
+    target["raw_output"] = f"{target.get('raw_output') or ''}\n{meta.get('raw_output') or ''}".strip()
+
+
 class VisionOCRClient:
     """deepseek-flash 视觉 OCR 客户端（OpenAI 兼容 chat completions）。"""
 
@@ -502,7 +563,17 @@ class VisionOCRClient:
             kwargs["http_client"] = httpx.Client(trust_env=False, timeout=self.timeout)
         return OpenAI(**kwargs)
 
-    def _call(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _call(
+        self,
+        messages: List[Dict[str, Any]],
+        on_retry: Optional[Callable[[int, Exception], None]] = None,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """调用一次视觉模型，返回 (解析结果, 调用元信息)。
+
+        元信息带上 usage、耗时、尝试次数和模型原始 content，调用方据此推送
+        “AI 输出”事件。重试前的 on_retry 回调让上层能发“重试中”告警；本方法
+        不保存任何跨线程可变状态，可被多个 worker 线程同时调用。
+        """
         last_error: Optional[Exception] = None
         for attempt in range(1, 3):
             started = time.time()
@@ -511,19 +582,33 @@ class VisionOCRClient:
                     model=self.model,
                     messages=messages,
                     response_format={"type": "json_object"},
-                    max_tokens=16000,
+                    max_tokens=MAX_OUTPUT_TOKENS,
                     temperature=0.2,
                     extra_body={"thinking": {"type": "disabled"}},
                 )
-                content = response.choices[0].message.content or ""
+                choice = response.choices[0]
+                content = choice.message.content or ""
+                finish_reason = str(getattr(choice, "finish_reason", "") or "")
                 if not content.strip():
                     raise ValueError("模型返回空 content")
-                data = json.loads(content)
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    # 输出被 max_tokens 截断时 JSON 一定不闭合；这种失败重调同样请求只会
+                    # 再被截断一次，所以要交给上层拆页/精简，而不是原地重试。
+                    if finish_reason == "length" or (len(content) > 20000 and "Unterminated" in str(exc)):
+                        raise VisionOutputTruncated(
+                            f"输出达到 {MAX_OUTPUT_TOKENS} token 上限被截断（{len(content)} 字符，finish={finish_reason or 'unknown'}）"
+                        ) from exc
+                    raise
                 usage = response.usage.model_dump() if response.usage else {}
+                duration = time.time() - started
                 logger.info(
-                    "视觉 OCR 调用完成: %.1fs, tokens=%s, questions=%s",
-                    time.time() - started,
+                    "视觉 OCR 调用完成: %.1fs, tokens=%s(completion=%s), finish=%s, questions=%s",
+                    duration,
                     usage.get("total_tokens"),
+                    usage.get("completion_tokens"),
+                    finish_reason or "unknown",
                     len(data.get("questions") or []),
                 )
                 try:
@@ -532,16 +617,306 @@ class VisionOCRClient:
                     record_native_usage("openai", self.model, usage, stage="vision_ocr")
                 except Exception:  # noqa: BLE001
                     logger.warning("记录视觉 OCR 用量失败", exc_info=True)
-                return data
+                return data, {
+                    "usage": usage,
+                    "duration": duration,
+                    "attempt": attempt,
+                    "finish_reason": finish_reason,
+                    "raw_output": content,
+                }
+            except VisionOutputTruncated:
+                # 输出超长是确定性失败：让上层按页拆分或切换精简模式，避免白等一次重试
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 logger.warning("视觉 OCR 第 %s 次调用失败: %s", attempt, exc)
                 if attempt < 2:
+                    if on_retry is not None:
+                        try:
+                            on_retry(attempt, exc)
+                        except Exception:  # noqa: BLE001
+                            logger.warning("视觉 OCR 重试事件回调失败", exc_info=True)
                     time.sleep(2)
         raise RuntimeError(f"视觉 OCR 调用失败: {type(last_error).__name__}: {last_error}")
 
-    def parse_document(self, file_paths: List[str], output_dir: str) -> Dict[str, Any]:
-        """解析一份试卷（可多文件/多页），返回 pages + questions + tagged_text。"""
+    def _build_chunk_messages(
+        self,
+        chunk_metas: List[Dict[str, Any]],
+        chunk_images: List[Image.Image],
+        compact: bool = False,
+        existing_tags: str = "",
+    ) -> List[Dict[str, Any]]:
+        """构造一个批次的 messages；图片编码放在 worker 线程内完成。
+
+        PIL 缩放与 base64 编码是 CPU 密集型操作，随批次一起下放到 worker，
+        多个批次可以同时编码，同时避免在主线程串行编码拖慢首个请求。
+        compact=True 用于输出被截断后的补救：优先保证 JSON 完整闭合，牺牲 tagged_text。
+        """
+        content: List[Dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": USER_PROMPT.format(
+                    page_count=len(chunk_metas), existing_tags=existing_tags or "无"
+                )
+                + "\n本次页码：" + "、".join(str(p["page_index"]) for p in chunk_metas)
+                + (
+                    "\n\n【重要】上一次输出超出长度上限被截断：这次必须精简 —— "
+                    "tagged_text 输出空字符串，knowledge_tags 仍要保留（每题 1-3 个），"
+                    "questions/handwriting/grading 只保留必要字段与红笔批改信息，"
+                    "任何内容都不要重复，确保 JSON 完整闭合。"
+                    if compact
+                    else ""
+                ),
+            }
+        ]
+        for meta, image in zip(chunk_metas, chunk_images):
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"第 {meta['page_index']} 页整页（原图 {meta['width']}x{meta['height']} 像素）",
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{_encode_jpeg(image, PAGE_MAX_SIDE)}", "detail": "original"},
+                }
+            )
+            if image.width * image.height > SPLIT_PIXEL_THRESHOLD or max(image.width, image.height) > SPLIT_SIDE_THRESHOLD:
+                for half_index, half in enumerate(_split_halves(image), 1):
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": f"第 {meta['page_index']} 页原生分辨率分片 {half_index}/2（原图 {image.width}x{image.height} 像素）",
+                        }
+                    )
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{_encode_jpeg(half, SPLIT_MAX_SIDE, quality=90)}", "detail": "original"},
+                        }
+                    )
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+
+    def _recognize_chunk(
+        self,
+        chunk_metas: List[Dict[str, Any]],
+        chunk_images: List[Image.Image],
+        *,
+        batch_label: str,
+        page_label: str,
+        emitter: EventEmitter,
+        on_retry: Optional[Callable[[int, Exception], None]] = None,
+        existing_tags: str = "",
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """识别一个（子）批次，输出被截断时按页拆分或切精简模式自救。
+
+        模型单次输出有 token 上限，页数多时结构化 JSON 可能写不完。与其原样重调
+        （同样会再截断一次），不如把批次对半拆开分别识别，最后按顺序合并；
+        单页仍截断时再让模型省略 tagged_text 精简输出。
+        """
+        try:
+            return self._call(
+                self._build_chunk_messages(chunk_metas, chunk_images, existing_tags=existing_tags),
+                on_retry=on_retry,
+            )
+        except VisionOutputTruncated as exc:
+            if len(chunk_metas) > 1:
+                emitter.emit(
+                    step="vision_batch",
+                    stage="视觉识别",
+                    level="warn",
+                    message=f"{batch_label}（{page_label}）输出超长被截断：{exc}，拆成两批分别识别",
+                )
+                middle = len(chunk_metas) // 2
+                parts = [
+                    (chunk_metas[:middle], chunk_images[:middle]),
+                    (chunk_metas[middle:], chunk_images[middle:]),
+                ]
+                merged: Optional[Dict[str, Any]] = None
+                combined: Dict[str, Any] = {}
+                for part_metas, part_images in parts:
+                    data, meta = self._recognize_chunk(
+                        part_metas,
+                        part_images,
+                        batch_label=batch_label,
+                        page_label=_page_range_label(part_metas),
+                        emitter=emitter,
+                        on_retry=on_retry,
+                        existing_tags=existing_tags,
+                    )
+                    merged = _merge_chunk_data(merged, data)
+                    _accumulate_meta(combined, meta)
+                return merged or {}, combined
+
+            emitter.emit(
+                step="vision_batch",
+                stage="视觉识别",
+                level="warn",
+                message=f"{batch_label}（{page_label}）输出超长被截断：{exc}，改用精简模式重试",
+            )
+            return self._call(
+                self._build_chunk_messages(
+                    chunk_metas, chunk_images, compact=True, existing_tags=existing_tags
+                ),
+                on_retry=on_retry,
+            )
+
+    def _run_chunk(
+        self,
+        chunk_index: int,
+        chunk_metas: List[Dict[str, Any]],
+        chunk_images: List[Image.Image],
+        total_chunks: int,
+        emitter: EventEmitter,
+        progress: _BatchProgress,
+        existing_tags: str = "",
+    ) -> Dict[str, Any]:
+        """识别一个批次，并把开始/识别中/重试/完成/失败事件推给前端。"""
+        # 事件里用 1 基页码，和「第 a-b 页」的中文文案保持一致
+        first_page = chunk_metas[0]["page_index"] + 1
+        last_page = chunk_metas[-1]["page_index"] + 1
+        page_label = _page_range_label(chunk_metas)
+        batch_label = f"第 {chunk_index + 1}/{total_chunks} 批"
+        emitter.emit(
+            step="vision_batch",
+            stage="视觉识别",
+            message=f"正在识别{batch_label}：{page_label}",
+            progress=progress.current(),
+        )
+
+        def _on_retry(attempt: int, exc: Exception) -> None:
+            emitter.emit(
+                step="vision_batch",
+                stage="视觉识别",
+                level="warn",
+                message=f"{batch_label}（{page_label}）第 {attempt} 次调用失败：{type(exc).__name__}: {exc}，2 秒后重试",
+                progress=progress.current(),
+            )
+
+        # 视觉识别是非流式调用，一批要几十秒，期间前端只有“正在识别”一条日志。
+        # 定时推一条“已用 N 秒”，让用户知道任务还在跑而不是卡死。
+        started = time.time()
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat() -> None:
+            while not stop_heartbeat.wait(5.0):
+                emitter.emit(
+                    step="vision_batch",
+                    stage="视觉识别",
+                    message=f"{batch_label}（{page_label}）识别中… 已用 {time.time() - started:.0f}s",
+                    progress=progress.current(),
+                )
+
+        heartbeat = threading.Thread(target=_heartbeat, name="vision-heartbeat", daemon=True)
+        heartbeat.start()
+        try:
+            chunk_result, meta = self._recognize_chunk(
+                chunk_metas,
+                chunk_images,
+                batch_label=batch_label,
+                page_label=page_label,
+                emitter=emitter,
+                on_retry=_on_retry,
+                existing_tags=existing_tags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            stop_heartbeat.set()
+            emitter.emit(
+                step="vision_batch",
+                stage="视觉识别",
+                level="error",
+                message=f"{batch_label}（{page_label}）识别失败：{exc}",
+                progress=progress.current(),
+            )
+            raise
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=1.0)
+
+        usage = meta.get("usage") or {}
+        duration = float(meta.get("duration") or 0)
+        emitter.emit(
+            step="vision_batch",
+            stage="视觉识别",
+            level="success",
+            message=(
+                f"{batch_label}识别完成：{page_label}，耗时 {duration:.1f}s，"
+                f"tokens {int(usage.get('total_tokens') or 0)}，题目 {len(chunk_result.get('questions') or [])} 道"
+            ),
+            progress=progress.complete_next(),
+            detail=build_ai_call_detail(
+                model=self.model,
+                pages=list(range(first_page, last_page + 1)),
+                duration=duration,
+                tokens=usage,
+                attempt=int(meta.get("attempt") or 1),
+                output=str(meta.get("raw_output") or ""),
+            ),
+        )
+        return chunk_result
+
+    def _run_chunks(
+        self,
+        chunks: List[tuple],
+        workers: int,
+        emitter: EventEmitter,
+        total_chunks: int,
+        existing_tags: str = "",
+    ) -> List[Dict[str, Any]]:
+        """并发执行所有批次，并按批次顺序返回结果。
+
+        顺序在收集阶段保证：按 futures 列表顺序取 result()，因此下游合并逻辑
+        与串行实现完全一致（题目顺序稳定，subject 取第一段非空值）。
+        """
+        progress = _BatchProgress(total_chunks)
+        results: List[Optional[Dict[str, Any]]] = [None] * total_chunks
+        if total_chunks == 1:
+            _, chunk_metas, chunk_images = chunks[0]
+            results[0] = self._run_chunk(
+                0, chunk_metas, chunk_images, total_chunks, emitter, progress, existing_tags
+            )
+            return results  # type: ignore[return-value]
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vision-ocr") as pool:
+            # copy_context 把调用方的 usage 上下文带进 worker，否则并发后
+            # record_native_usage 在子线程里拿不到当前计费上下文。
+            futures = [
+                pool.submit(
+                    copy_context().run,
+                    self._run_chunk,
+                    index,
+                    chunk_metas,
+                    chunk_images,
+                    total_chunks,
+                    emitter,
+                    progress,
+                    existing_tags,
+                )
+                for index, chunk_metas, chunk_images in chunks
+            ]
+            for index, future in enumerate(futures):
+                results[index] = future.result()
+        return results  # type: ignore[return-value]
+
+    def parse_document(
+        self,
+        file_paths: List[str],
+        output_dir: str,
+        emitter: Optional[EventEmitter] = None,
+        max_workers: Optional[int] = None,
+        existing_tags: str = "",
+    ) -> Dict[str, Any]:
+        """解析一份试卷（可多文件/多页），返回 pages + questions + tagged_text。
+
+        多个批次并发调用视觉模型（默认 settings.vision_concurrency 路），结果仍按
+        批次顺序合并，输出与串行实现一致。emitter 传 None 时完全退化为纯函数式
+        行为，方便测试和其它调用方复用。existing_tags 为逗号分隔的已有知识点标签，
+        供模型优先复用、保持全库标签写法一致。
+        """
+        emitter = emitter or EventEmitter(None)
         os.makedirs(output_dir, exist_ok=True)
         page_metas: List[Dict[str, Any]] = []
         page_images: List[Image.Image] = []
@@ -576,6 +951,27 @@ class VisionOCRClient:
         if not page_images:
             raise RuntimeError("没有可识别的页面")
 
+        total = len(page_images)
+        chunks = [
+            (
+                chunk_index,
+                page_metas[start : start + MAX_PAGES_PER_REQUEST],
+                page_images[start : start + MAX_PAGES_PER_REQUEST],
+            )
+            for chunk_index, start in enumerate(range(0, total, MAX_PAGES_PER_REQUEST))
+        ]
+        total_chunks = len(chunks)
+        workers = _resolve_worker_count(max_workers, total_chunks)
+        emitter.emit(
+            step="vision_load",
+            stage="加载页面",
+            level="success",
+            message=f"已加载 {total} 页图片，分 {total_chunks} 批并行识别（{workers} 路）",
+            progress=0.0,
+        )
+
+        chunk_results = self._run_chunks(chunks, workers, emitter, total_chunks, existing_tags)
+
         merged: Dict[str, Any] = {
             "subject": "",
             "questions": [],
@@ -583,58 +979,16 @@ class VisionOCRClient:
             "grading": [],
             "tagged_text": "",
         }
-        total = len(page_images)
-        for start in range(0, total, MAX_PAGES_PER_REQUEST):
-            chunk = page_metas[start : start + MAX_PAGES_PER_REQUEST]
-            chunk_images = page_images[start : start + MAX_PAGES_PER_REQUEST]
-            content: List[Dict[str, Any]] = [
-                {
-                    "type": "text",
-                    "text": USER_PROMPT.format(page_count=len(chunk))
-                    + "\n本次页码：" + "、".join(str(p["page_index"]) for p in chunk),
-                }
-            ]
-            for meta, image in zip(chunk, chunk_images):
-                content.append(
-                    {
-                        "type": "text",
-                        "text": f"第 {meta['page_index']} 页整页（原图 {meta['width']}x{meta['height']} 像素）",
-                    }
-                )
-                content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{_encode_jpeg(image, PAGE_MAX_SIDE)}", "detail": "original"},
-                    }
-                )
-                if image.width * image.height > SPLIT_PIXEL_THRESHOLD or max(image.width, image.height) > SPLIT_SIDE_THRESHOLD:
-                    for half_index, half in enumerate(_split_halves(image), 1):
-                        content.append(
-                            {
-                                "type": "text",
-                                "text": f"第 {meta['page_index']} 页原生分辨率分片 {half_index}/2（原图 {image.width}x{image.height} 像素）",
-                            }
-                        )
-                        content.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{_encode_jpeg(half, SPLIT_MAX_SIDE, quality=90)}", "detail": "original"},
-                            }
-                        )
+        for chunk_result in chunk_results:
+            merged = _merge_chunk_data(merged, chunk_result)
 
-            chunk_result = self._call(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
-                ]
-            )
-            if not merged["subject"]:
-                merged["subject"] = str(chunk_result.get("subject") or "").strip()
-            for key in ("questions", "handwriting", "grading"):
-                merged[key].extend(chunk_result.get(key) or [])
-            tagged = str(chunk_result.get("tagged_text") or "").strip()
-            if tagged:
-                merged["tagged_text"] = (merged["tagged_text"] + "\n\n" + tagged).strip() if merged["tagged_text"] else tagged
+        emitter.emit(
+            step="vision_merge",
+            stage="汇总结果",
+            level="success",
+            message=f"汇总完成：{total} 页，{len(merged['questions'])} 道题目",
+            progress=1.0,
+        )
 
         questions = normalize_vision_result(merged, len(page_metas))
         blocks_by_page = _build_page_blocks(questions, merged["handwriting"], merged["grading"])

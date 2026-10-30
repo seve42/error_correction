@@ -37,6 +37,21 @@ def get_user_session(user_id) -> dict:
     return _user_sessions[key]
 
 
+def ordered_file_keys(us: dict) -> list:
+    """按用户选择时的顺序返回 file_key 列表。
+
+    前端为了提高速度会并发上传多个批次，后端只能按请求到达顺序登记，
+    跨批次的先后并不可靠（大文件后发的批次可能先到）。因此优先使用前端
+    逐文件上报的 order 排序；设备拍照等没有 order 的来源退回登记顺序。
+    """
+    files = us["session_files"]
+    keys = [k for k in us["session_file_order"] if k in files]
+    orders = {k: files.get(k, {}).get("order") for k in keys}
+    if any(order is None for order in orders.values()):
+        return keys
+    return sorted(keys, key=lambda k: orders[k])
+
+
 def clear_user_session(user_id):
     """清除指定用户的会话状态"""
     key = user_id if user_id is not None else "anon"

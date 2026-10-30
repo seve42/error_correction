@@ -15,6 +15,11 @@ const props = defineProps({
   previewUrl: { type: String, default: '' },
   // 当前选择的视觉模型名，用于加载提示；为空时使用通用文案
   modelName: { type: String, default: '' },
+  // 任务进度：progress 为 null 表示还没收到事件，SplitLoading 会退回模拟动画
+  progress: { type: Number, default: null },
+  stage: { type: String, default: '' },
+  events: { type: Array, default: () => [] },
+  running: { type: Boolean, default: true },
 })
 
 // 加载标题带上当前模型名，避免绑定具体品牌。
@@ -138,7 +143,14 @@ watch(() => props.pages.length, (len) => {
     <!-- 加载中 -->
     <div v-if="loading" class="flex-1 min-h-0 relative">
       <img v-if="previewUrl" :src="previewUrl" class="absolute inset-0 w-full h-full object-contain opacity-10 blur-sm" alt="" />
-      <SplitLoading :title="loadingTitle" subtitle="正在解析页面上的印刷题目、手写作答与红笔批改" />
+      <SplitLoading
+        :title="loadingTitle"
+        subtitle="正在解析页面上的印刷题目、手写作答与红笔批改"
+        :progress="progress"
+        :stage="stage"
+        :events="events"
+        :running="running"
+      />
     </div>
 
     <!-- 无数据 -->

@@ -3,8 +3,9 @@
  * QuestionList.vue
  * 题目列表容器（选择 + 批量操作）
  */
-import { ref, nextTick, watch, onMounted } from 'vue'
+import { ref, computed, nextTick, watch, onMounted } from 'vue'
 import QuestionCard from './QuestionCard.vue'
+import BatchSelectBar from '../shared/BatchSelectBar.vue'
 import { typesetMath } from '@/utils/index'
 
 const props = defineProps({
@@ -17,6 +18,16 @@ const emit = defineEmits(['toggle-select', 'select-all', 'deselect-all', 'open-i
 const questionListEl = ref(null)
 const questionsBoxEl = ref(null)
 let sortable = null
+
+/** 当前列表是否已全部选中，用于全选/取消全选。 */
+const allSelected = computed(
+  () => props.questions.length > 0 && props.questions.every((q) => props.selectedIds.has(q.uid)),
+)
+
+const toggleSelectAll = () => {
+  if (allSelected.value) emit('deselect-all')
+  else emit('select-all')
+}
 
 const triggerTypeset = async () => {
   await nextTick()
@@ -64,8 +75,18 @@ defineExpose({ initSortable, questionsBoxEl, triggerTypeset })
 
 <template>
   <div v-if="questions.length" ref="questionsBoxEl" class="relative z-10">
+      <!-- 批量选择 -->
+      <BatchSelectBar
+        class="mt-6"
+        :selected-count="selectedIds.size"
+        :total-count="questions.length"
+        :all-selected="allSelected"
+        @toggle-all="toggleSelectAll"
+        @clear="emit('deselect-all')"
+      />
+
       <!-- 题目列表 -->
-      <div ref="questionListEl" class="relative z-10 mt-6 grid gap-5" id="questionList">
+      <div ref="questionListEl" class="relative z-10 mt-3 grid gap-5" id="questionList">
         <QuestionCard
           v-for="q in questions"
           :key="q.uid"

@@ -20,7 +20,6 @@ import ReviewStage from '@/components/features/app/workspace/ReviewStage.vue'
 import SplitHistory from '@/views/app/SplitHistoryView.vue'
 import BaseModal from '@/components/base/BaseModal.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseToolbarButton from '@/components/base/BaseToolbarButton.vue'
 
 defineOptions({ name: 'WorkspaceView' })
@@ -54,12 +53,14 @@ const splitting = ref(false)
 const splitCompleted = ref(false)
 const showSplitHistory = ref(false)
 
-// 擦除步骤已并入视觉 OCR，试卷模式固定为 上传 → 识别 → 分割 → 导出。
-const S = computed(() => ({ UPLOAD: 1, OCR: 2, SPLIT: 3, EXPORT: 4 }))
+// 试卷模式：上传 → 识别 → 分割 → 生成解析 → 导出；笔记模式不含解析步骤。
+const S = computed(() => (uploadMode.value === 'note'
+  ? { UPLOAD: 1, OCR: 2, SPLIT: 3, EXPORT: 4 }
+  : { UPLOAD: 1, OCR: 2, SPLIT: 3, ANSWER: 4, EXPORT: 5 }))
 const workspaceSteps = computed(() => {
   const labels = uploadMode.value === 'note'
     ? ['上传', 'OCR', '整理', '保存']
-    : ['上传', '识别', '分割', '导出']
+    : ['上传', '识别', '分割', '生成解析', '导出']
   return labels.map((label, i) => ({
     label,
     done: i + 1 < step.value,
@@ -71,7 +72,8 @@ const workspaceSteps = computed(() => {
 const {
   uploadBusy, uploadReady, pendingFiles, pendingPreviewUrls,
   fileProgress, waitingKeys,
-  enqueueUpload, removePendingFile, stopFakeProgress, doReset: _doReset,
+  uploadPercent, uploadDone, uploadTotal,
+  enqueueUpload, removePendingFile, doReset: _doReset,
 } = useFileUpload(pushToast, S, questions, selectedIds, splitCompleted, splitting, uploadMode)
 
 const splitEnabled = computed(() => !splitting.value && !splitCompleted.value && uploadReady.value && !uploadBusy.value && hasConfiguredModel.value)
@@ -100,6 +102,7 @@ const savePersistedWorkspaceState = () => {
     currentView: currentView.value,
     uploadMode: uploadMode.value,
     workflowMode: workflowMode.value,
+    autoGenerateAnswers: autoGenerateAnswers.value,
     savedAt: Date.now(),
   }
   try {
@@ -125,6 +128,7 @@ const restorePersistedWorkspaceState = async () => {
   splitCompleted.value = Boolean(state.splitCompleted)
   uploadMode.value = state.uploadMode === 'note' ? 'note' : 'exam'
   workflowMode.value = state.workflowMode === 'auto' ? 'auto' : 'manual'
+  autoGenerateAnswers.value = state.autoGenerateAnswers !== false
   // 旧快照可能停留在已移除的擦除步骤（step=5），统一收敛到新流程的最大步骤。
   const restoredStep = Number(state.step) || S.value.EXPORT
   step.value = Math.min(Math.max(restoredStep, S.value.UPLOAD), S.value.EXPORT)
@@ -138,24 +142,32 @@ const restorePersistedWorkspaceState = async () => {
  */
 const doReset = async () => {
   await _doReset(modelOptionsData, selectedLlmOptionId, step)
+  // 重置后旧任务的日志与事件已无意义，清空避免下一轮误显示上一轮进度
+  pipelineProgress.reset()
   clearPersistedWorkspaceState()
   step.value = S.value.UPLOAD
 }
 
 // ── 分割流水线 ──────────────────────────────────────────
+// 「生成标准答案解析」在上传前决定，默认开启，作为导入流程的独立一步执行。
+const autoGenerateAnswers = ref(true)
 const {
-  ocrLoading, ocrPages, ocrDone, notePreview, autoProcessing,
+  ocrLoading, ocrPages, ocrDone, notePreview, autoProcessing, answering,
   startProcess, runAutoProcess, doOcr, doSplit, doSaveToDb, saveNoteToProject, setLoadedSplitRecord,
-  generateSelectedAnswers,
-} = useSplitPipeline(pushToast, currentView, step, S, uploadReady, splitting, splitCompleted, uploadMode, selectedLlmOption, questions, selectedIds, pendingFiles, typesetMath)
+  progress: pipelineProgress,
+} = useSplitPipeline(pushToast, currentView, step, S, uploadReady, splitting, splitCompleted, uploadMode, selectedLlmOption, questions, selectedIds, pendingFiles, typesetMath, autoGenerateAnswers)
+
+// 任务日志以 ref 形式暴露给模板（模板只会自动解包顶层 ref，嵌套在对象里的 ref 不会）
+const taskEvents = pipelineProgress.events
+const taskPercent = pipelineProgress.progress
+const taskStage = pipelineProgress.stage
+const taskRunning = pipelineProgress.running
 
 const reviewStageRef = ref(null)
 const restoringWorkspaceState = ref(true)
 const importDialogOpen = ref(false)
 const importTargetProjectId = ref(null)
 const importSaving = ref(false)
-const autoGenerateAnswers = ref(false)
-const generatingAnswers = ref(false)
 const noteSaveDialogOpen = ref(false)
 const noteTargetProjectId = ref(null)
 const noteSaving = ref(false)
@@ -165,7 +177,7 @@ const updateSelectedLlmOption = (value) => {
 const hasReviewContent = computed(() => {
   if (ocrLoading.value) return true
   if (ocrDone.value) return true
-  if (splitting.value) return true
+  if (splitting.value || answering.value) return true
   if (splitCompleted.value && questions.value.length > 0) return true
   return false
 })
@@ -206,7 +218,6 @@ const openImportDialog = () => {
     return
   }
   importTargetProjectId.value = activeQuestionProjectId.value || questionProjects.value[0]?.id || null
-  autoGenerateAnswers.value = false
   importDialogOpen.value = true
 }
 
@@ -241,23 +252,18 @@ const closeNoteSaveDialog = () => {
 
 /**
  * 将选中题目保存到目标错题库，成功后切换当前错题库。
+ * 标准答案解析已在分割后的独立步骤生成，这里只负责落库。
  */
 const confirmImportToProject = async () => {
   if (!importTargetProjectId.value || importSaving.value) return
   importSaving.value = true
   try {
-    if (autoGenerateAnswers.value) {
-      generatingAnswers.value = true
-      const generated = await generateSelectedAnswers()
-      if (!generated) return
-    }
     const saved = await doSaveToDb(importTargetProjectId.value)
     if (saved) {
       setActiveProject(importTargetProjectId.value, 'question')
       importDialogOpen.value = false
     }
   } finally {
-    generatingAnswers.value = false
     importSaving.value = false
   }
 }
@@ -341,7 +347,6 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
-  stopFakeProgress()
   document.removeEventListener('keydown', onKeydown)
 })
 </script>
@@ -373,21 +378,26 @@ onBeforeUnmount(() => {
           :selected-llm-option-id="selectedLlmOptionId" :has-configured-model="hasConfiguredModel"
           :splitting="splitting || autoProcessing" :split-completed="splitCompleted" :pending-files="pendingFiles"
           :file-progress="fileProgress" :waiting-keys="waitingKeys" :upload-busy="uploadBusy"
-          :upload-ready="uploadReady" :split-enabled="splitEnabled" @update:upload-mode="(v) => uploadMode = v"
+          :upload-ready="uploadReady" :upload-percent="uploadPercent" :upload-done="uploadDone"
+          :upload-total="uploadTotal" :split-enabled="splitEnabled" :auto-generate-answers="autoGenerateAnswers"
+          @update:upload-mode="(v) => uploadMode = v"
           @update:workflow-mode="(v) => workflowMode = v"
+          @update:auto-generate-answers="(v) => autoGenerateAnswers = v"
           @update:selected-llm-option-id="updateSelectedLlmOption" @upload="enqueueUpload"
           @remove-file="removePendingFile" @split="handleStartProcess" />
       </ContentPanel>
 
       <!-- 第二页：解析结果核对 -->
       <ContentPanel v-else-if="currentView === 'workspace_review'" key="review"
-        :title="splitting
-          ? (uploadMode === 'note' ? '正在整理笔记...' : '正在分割...')
-          : uploadMode === 'note' && notePreview
-            ? '笔记整理结果'
-            : ocrDone && !splitCompleted
-              ? '识别预览'
-              : '题目数据核对'"
+        :title="answering
+          ? '正在生成答案解析...'
+          : splitting
+            ? (uploadMode === 'note' ? '正在整理笔记...' : '正在分割...')
+            : uploadMode === 'note' && notePreview
+              ? '笔记整理结果'
+              : ocrDone && !splitCompleted
+                ? '识别预览'
+                : '题目数据核对'"
         :steps="workspaceSteps" :current-step="step - 1">
         <template #toolbar>
           <BaseToolbarButton icon="fa-arrow-left-long" @click="handleBack">
@@ -406,8 +416,9 @@ onBeforeUnmount(() => {
 
         <ReviewStage ref="reviewStageRef"
           :ocr-loading="ocrLoading" :ocr-done="ocrDone" :ocr-pages="ocrPages"
-          :upload-mode="uploadMode" :splitting="splitting" :split-completed="splitCompleted" :questions="questions" :selected-ids="selectedIds"
+          :upload-mode="uploadMode" :splitting="splitting" :answering="answering" :split-completed="splitCompleted" :questions="questions" :selected-ids="selectedIds"
           :note-preview="notePreview" :model-name="selectedLlmOption?.model_name || ''"
+          :task-events="taskEvents" :task-progress="taskPercent" :task-stage="taskStage" :task-running="taskRunning"
           :preview-url="pendingPreviewUrls[0]" @toggle-select="toggleQuestion" @select-all="selectAll"
           @deselect-all="deselectAll" @open-image="openModal" @reorder="reorderQuestions" />
       </ContentPanel>
@@ -435,11 +446,9 @@ onBeforeUnmount(() => {
             <i v-if="String(importTargetProjectId) === String(project.id)" class="fa-solid fa-check text-xs"></i>
           </button>
         </div>
-        <div class="rounded-lg border border-slate-200/70 bg-white/50 px-3 py-2.5 dark:border-white/[0.08] dark:bg-white/[0.03]">
-          <BaseCheckbox v-model="autoGenerateAnswers" label="自动生成标准答案解析（AI）"
-            description="导入前先用当前模型为选中的题目生成标准答案与解析，取消勾选则直接导入。"
-            :disabled="importSaving" />
-        </div>
+        <p class="text-xs text-slate-400 dark:text-[#6f7683]">
+          标准答案解析在上传前由「生成标准答案解析」选项控制，已在分割完成后自动生成并随题目一并导入。
+        </p>
       </div>
       <template #footer>
         <BaseButton variant="secondary" size="sm" :disabled="importSaving" @click="closeImportDialog">
@@ -447,7 +456,7 @@ onBeforeUnmount(() => {
         </BaseButton>
         <BaseButton variant="primary" size="sm" :disabled="importSaving || !importTargetProjectId"
           @click="confirmImportToProject">
-          {{ generatingAnswers ? '生成中…' : importSaving ? '导入中...' : '确认导入' }}
+          {{ importSaving ? '导入中...' : '确认导入' }}
         </BaseButton>
       </template>
     </BaseModal>

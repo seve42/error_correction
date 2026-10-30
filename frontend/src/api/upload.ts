@@ -105,11 +105,14 @@ export function uploadFiles(formData: FormData, { onProgress, onSuccess, onError
  * 调用视觉 OCR 接口，识别上传页面上的印刷题、手写作答与红笔批改。
  * 后端不再返回可靠 bbox，预览以页面图和识别文本列表为主。
  */
-export async function runOcr(engine: OcrEngine = 'vision') {
+export async function runOcr(engine: OcrEngine = 'vision', taskId?: string) {
+  const body: ApiRequestBody = { engine }
+  // task_id 与 SSE 订阅共用；后端未实现时忽略该字段即可，不影响旧流程。
+  if (taskId) body.task_id = taskId
   const resp = await fetch('/api/ocr', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ engine }),
+    body: JSON.stringify(body),
   })
   return assertJsonSuccess<OcrResponse>(resp, '视觉识别失败')
 }
@@ -123,11 +126,14 @@ export async function splitQuestions(
   providerSource?: string,
   providerId?: Id | null,
   ocrEngine: OcrEngine = 'vision',
+  taskId?: string,
 ) {
+  const extra: ApiRequestBody = { ocr_engine: ocrEngine }
+  if (taskId) extra.task_id = taskId
   const resp = await fetch('/api/split', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(buildModelBody(modelProvider, modelName, providerSource, providerId, { ocr_engine: ocrEngine })),
+    body: JSON.stringify(buildModelBody(modelProvider, modelName, providerSource, providerId, extra)),
   })
   return assertJsonSuccess<SplitResponse>(resp, '题目分割失败')
 }

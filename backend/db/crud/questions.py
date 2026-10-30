@@ -458,7 +458,7 @@ def save_questions_to_db(
             has_formula=q.get("has_formula", False),
             has_image=q.get("has_image", False),
             image_refs_json=json.dumps(q.get("image_refs"), ensure_ascii=False) if q.get("image_refs") else None,
-            page_image_ref=q.get("page_image") or None,
+            page_image_ref=json.dumps(q.get("page_images"), ensure_ascii=False) if q.get("page_images") else (q.get("page_image") or None),
             needs_correction=q.get("needs_correction", False),
             ocr_issues_json=json.dumps(q.get("ocr_issues"), ensure_ascii=False) if q.get("ocr_issues") else None,
             answer=q.get("answer") or None,
@@ -631,8 +631,19 @@ def search_questions(
     return questions, total
 
 
-def query_questions(
-    db: Session,
+def _build_question_query(db: Session, user_id=None, project_id=None):
+    """构造题目基础查询（按用户/项目隔离）。"""
+    query = db.query(Question).join(UploadBatch)
+
+    if user_id is not None:
+        query = query.filter(Question.user_id == user_id)
+    if project_id is not None:
+        query = query.filter(Question.project_id == project_id)
+    return query
+
+
+def _apply_question_filters(
+    query,
     subject: Optional[str] = None,
     knowledge_tag: Optional[str] = None,
     question_type: Optional[str] = None,
@@ -640,26 +651,8 @@ def query_questions(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     review_status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-    user_id=None,
-    project_id=None,
-) -> Tuple[List[Question], int]:
-    """
-    统一查询题目（合并 get_history_questions 和 search_questions 的能力）
-
-    支持所有筛选条件任意组合。
-    """
-    query = db.query(Question).join(UploadBatch)
-
-    if user_id is not None:
-        query = query.filter(Question.user_id == user_id)
-    if project_id is not None:
-        query = query.filter(Question.project_id == project_id)
-
-    # 未筛选的总收录数（仅按用户隔离）
-    grand_total = query.distinct().count()
-
+):
+    """在基础查询上应用错题库通用筛选条件。"""
     subject_list = _parse_filter_list(subject)
     if subject_list:
         query = query.filter(UploadBatch.subject.in_(subject_list))
@@ -689,6 +682,44 @@ def query_questions(
     if review_status_list:
         query = query.filter(Question.review_status.in_(review_status_list))
 
+    return query
+
+
+def query_questions(
+    db: Session,
+    subject: Optional[str] = None,
+    knowledge_tag: Optional[str] = None,
+    question_type: Optional[str] = None,
+    keyword: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    review_status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    user_id=None,
+    project_id=None,
+) -> Tuple[List[Question], int]:
+    """
+    统一查询题目（合并 get_history_questions 和 search_questions 的能力）
+
+    支持所有筛选条件任意组合。
+    """
+    query = _build_question_query(db, user_id=user_id, project_id=project_id)
+
+    # 未筛选的总收录数（仅按用户隔离）
+    grand_total = query.distinct().count()
+
+    query = _apply_question_filters(
+        query,
+        subject=subject,
+        knowledge_tag=knowledge_tag,
+        question_type=question_type,
+        keyword=keyword,
+        start_date=start_date,
+        end_date=end_date,
+        review_status=review_status,
+    )
+
     total = query.distinct().count()
 
     offset = (page - 1) * page_size
@@ -702,6 +733,34 @@ def query_questions(
     )
 
     return questions, total, grand_total
+
+
+def query_question_ids(
+    db: Session,
+    subject: Optional[str] = None,
+    knowledge_tag: Optional[str] = None,
+    question_type: Optional[str] = None,
+    keyword: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    review_status: Optional[str] = None,
+    user_id=None,
+    project_id=None,
+) -> List[int]:
+    """按筛选条件返回全部题目 ID（供错题库跨页全选使用）。"""
+    query = _build_question_query(db, user_id=user_id, project_id=project_id)
+    query = _apply_question_filters(
+        query,
+        subject=subject,
+        knowledge_tag=knowledge_tag,
+        question_type=question_type,
+        keyword=keyword,
+        start_date=start_date,
+        end_date=end_date,
+        review_status=review_status,
+    )
+    rows = query.with_entities(Question.id).distinct().all()
+    return [row[0] for row in rows]
 
 
 def get_questions_by_ids(db: Session, question_ids: List[int], user_id=None) -> List[Question]:
@@ -757,6 +816,63 @@ def delete_question(db: Session, question_id: int, user_id=None) -> bool:
         raise
 
     return True
+
+
+def delete_questions(db: Session, question_ids: List[int], user_id=None) -> int:
+    """
+    批量删除题目
+
+    Args:
+        db: 数据库会话
+        question_ids: 题目 ID 列表
+        user_id: 用户ID（非 None 时只删除属于该用户的题目）
+
+    Returns:
+        实际删除的题目数量
+    """
+    ids = sorted({int(question_id) for question_id in question_ids or []})
+    if not ids:
+        return 0
+
+    deleted = 0
+    try:
+        # 分批删除，避免单条 SQL 的变量数量超限
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            query = db.query(Question).filter(Question.id.in_(chunk))
+            if user_id is not None:
+                query = query.filter(Question.user_id == user_id)
+            questions = query.all()
+            if not questions:
+                continue
+
+            deleted_ids = [question.id for question in questions]
+            batch_ids = {question.batch_id for question in questions if question.batch_id}
+
+            # 删除关联的标签映射
+            db.query(QuestionTagMapping).filter(
+                QuestionTagMapping.question_id.in_(deleted_ids)
+            ).delete(synchronize_session=False)
+
+            for question in questions:
+                db.delete(question)
+            db.flush()
+
+            # 检查批次是否已空，若空则清理
+            for batch_id in batch_ids:
+                other_q = db.query(Question.id).filter(Question.batch_id == batch_id).first()
+                if not other_q:
+                    db.query(UploadBatch).filter(UploadBatch.id == batch_id).delete()
+
+            deleted += len(questions)
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"批量删除题目失败: {e}")
+        raise
+
+    return deleted
 
 
 def update_user_answer(db: Session, question_id: int, user_answer: str, user_id=None) -> Optional[Question]:

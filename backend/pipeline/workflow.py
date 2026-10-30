@@ -19,6 +19,7 @@ from rich.console import Console
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from core.config import settings
+from core.task_progress import EventEmitter
 from .utils import (
     QUESTION_IMAGE_URL_PREFIX,
     prepare_input,
@@ -63,6 +64,7 @@ class WorkflowState(TypedDict, total=False):
     ocr_engine: str                      # "vision" | "paddleocr"
     ocr_cache_path: str                  # OCR 预览缓存文件路径（按用户隔离）
     results_dir: str                     # 本次运行的结果目录（按 user/run 隔离）
+    task_id: str                         # 前端进度任务 ID（用于实时事件推送，可缺省）
 
 
 # ── 节点函数 ──────────────────────────────────────────────
@@ -73,13 +75,27 @@ def prepare_input_node(state: WorkflowState) -> dict:
     console.print("[bold yellow]步骤 1: 准备输入文件[/bold yellow]")
     step_start = time.time()
 
+    emitter = EventEmitter(state.get("task_id"))
     file_paths = state["file_paths"]
+    emitter.emit(
+        step="prepare",
+        stage="准备",
+        message=f"正在标准化 {len(file_paths)} 个上传文件（PDF 会逐页转成图片）…",
+    )
     all_paths = []
     for fp in file_paths:
         all_paths.extend(prepare_input(fp))
 
     logger.info(f"步骤1完成: 准备输入文件，共 {len(all_paths)} 个文件（来自 {len(file_paths)} 个文件），耗时 {time.time() - step_start:.2f}s")
+    emitter.emit(
+        step="prepare",
+        stage="准备",
+        level="success",
+        message=f"准备完成：共 {len(all_paths)} 页图片，耗时 {time.time() - step_start:.2f}s",
+        progress=1.0,
+    )
     return {"image_paths": all_paths}
+
 
 
 # ── 并行分割辅助函数 ──────────────────────────────────────────
@@ -664,89 +680,47 @@ def _sort_key(qid: str):
         return (1, 0, qid)
 
 
-# 裁剪区域小于该像素数时视为无效配图（噪点、误标）
-FIGURE_MIN_CROP_PX = 8
-
-
-def _crop_question_figures(question: Dict[str, Any], page_image: str, image_dir: str, subdir: str) -> List[str]:
-    """按 figures.bbox（相对整页 0-1000）从整页图裁剪图形，返回可访问 URL 列表。"""
-    from PIL import Image
-
-    urls: List[str] = []
-    if not page_image or not os.path.isfile(page_image):
-        return urls
-    try:
-        with Image.open(page_image) as image:
-            width, height = image.size
-            for index, figure in enumerate(question.get("figures") or []):
-                bbox = figure.get("bbox") or []
-                if len(bbox) != 4:
-                    continue
-                left = max(int(round(bbox[0] / 1000 * width)), 0)
-                top = max(int(round(bbox[1] / 1000 * height)), 0)
-                right = min(int(round(bbox[2] / 1000 * width)), width)
-                bottom = min(int(round(bbox[3] / 1000 * height)), height)
-                if right - left < FIGURE_MIN_CROP_PX or bottom - top < FIGURE_MIN_CROP_PX:
-                    continue
-                crop = image.crop((left, top, right, bottom))
-                if crop.mode not in ("RGB", "L"):
-                    crop = crop.convert("RGB")
-                name = f"figure_{index + 1}_{uuid.uuid4().hex[:8]}.jpg"
-                crop.save(os.path.join(image_dir, name), format="JPEG", quality=90)
-                urls.append(f"{QUESTION_IMAGE_URL_PREFIX}{subdir}/{name}")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("裁剪题目配图失败（%s）: %s", page_image, exc)
-    return urls
-
-
 def _materialize_question_images(questions: List[Dict[str, Any]], pages: List[Dict[str, Any]]) -> None:
-    """把每题配图落地到持久目录：图形裁剪 + 整页原图。
+    """把题目涉及的整页原图落地到持久目录，供录入后查看。
 
-    bbox 为相对整页的 0-1000 归一化坐标；裁剪失败时降级为只保留整页图。
+    每题保留其 page_indexes 中所有页的页面图（跨页题目保留两张），
+    同一页的图只复制一次并由多题共享，避免重复占磁盘。
     """
     if not questions or not pages:
         return
     root = str(settings.question_images_dir)
-    os.makedirs(root, exist_ok=True)
     page_by_index = {
         page.get("page_index", 0): page for page in pages if isinstance(page, dict)
     }
+    pages_dir = os.path.join(root, "pages")
+    copied: Dict[int, str] = {}
 
     for question in questions:
-        page = page_by_index.get(question.get("page_index", 0))
-        if not page:
-            continue
-        subdir = uuid.uuid4().hex
-        image_dir = os.path.join(root, subdir)
-        os.makedirs(image_dir, exist_ok=True)
-
-        page_image = page.get("image_path") or ""
-        page_url = None
-        if page_image and os.path.isfile(page_image):
-            page_name = f"page_{uuid.uuid4().hex[:8]}.jpg"
+        indexes = question.get("page_indexes") or [question.get("page_index", 0)]
+        urls: List[str] = []
+        for index in indexes:
+            page = page_by_index.get(index)
+            if not page:
+                continue
+            if index in copied:
+                urls.append(copied[index])
+                continue
+            image_path = page.get("image_path") or ""
+            if not image_path or not os.path.isfile(image_path):
+                continue
+            os.makedirs(pages_dir, exist_ok=True)
+            name = f"page_{index + 1:02d}_{uuid.uuid4().hex[:8]}.jpg"
             try:
-                shutil.copyfile(page_image, os.path.join(image_dir, page_name))
-                page_url = f"{QUESTION_IMAGE_URL_PREFIX}{subdir}/{page_name}"
+                shutil.copyfile(image_path, os.path.join(pages_dir, name))
             except OSError as exc:
-                logger.warning("保存整页图失败（%s）: %s", page_image, exc)
-
-        figure_urls = _crop_question_figures(question, page_image, image_dir, subdir)
-        if not page_url and not figure_urls:
-            shutil.rmtree(image_dir, ignore_errors=True)
-            continue
-
-        # 裁剪图以 image content_block 追加在原有文本块之后
-        blocks = question.setdefault("content_blocks", [])
-        refs = list(question.get("image_refs") or [])
-        for url in figure_urls:
-            blocks.append({"block_type": "image", "content": url})
-            if url not in refs:
-                refs.append(url)
-        question["image_refs"] = refs or None
-        if page_url:
-            question["page_image"] = page_url
-        if figure_urls:
-            question["has_image"] = True
+                logger.warning("保存整页图失败（%s）: %s", image_path, exc)
+                continue
+            url = f"{QUESTION_IMAGE_URL_PREFIX}pages/{name}"
+            copied[index] = url
+            urls.append(url)
+        if urls:
+            question["page_images"] = urls
+            question["page_image"] = urls[0]
 
 
 def _split_questions_vision(state: WorkflowState) -> dict:
@@ -757,6 +731,7 @@ def _split_questions_vision(state: WorkflowState) -> dict:
     - 题目可选携带 student_answer / grading / red_marks，供前端与导出使用；
     - OCR 预览结果（pages + questions）由 /api/ocr 写入缓存，本函数优先复用。
     """
+    emitter = EventEmitter(state.get("task_id"))
     results_dir = state.get("results_dir") or settings.results_dir
     os.makedirs(results_dir, exist_ok=True)
     questions_file = os.path.join(results_dir, "questions.json")
@@ -781,12 +756,28 @@ def _split_questions_vision(state: WorkflowState) -> dict:
                 os.remove(ocr_cache_path)
                 console.print(f"[green][OK] 使用视觉 OCR 缓存: {len(result.get('pages') or [])} 页[/green]")
                 logger.info("使用视觉 OCR 缓存: %s 页", len(result.get("pages") or []))
+                emitter.emit(
+                    step="vision_load",
+                    stage="加载页面",
+                    level="success",
+                    message=(
+                        f"复用视觉识别缓存：{len(result.get('pages') or [])} 页、"
+                        f"{len(result.get('questions') or [])} 道题目（无需重新调用模型）"
+                    ),
+                    progress=0.0,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取视觉 OCR 缓存失败: %s，将重新识别", exc)
 
     if result is None:
         creds = state.get("vision_credentials") or {}
         if not creds.get("api_key"):
+            emitter.emit(
+                step="vision_load",
+                stage="加载页面",
+                level="error",
+                message="未配置支持图像理解的模型，请前往设置页配置后重试",
+            )
             return {
                 "questions": [],
                 "warnings": ["步骤 2 失败：未配置支持图像理解的模型，请前往设置页配置支持图像理解的模型"],
@@ -794,15 +785,32 @@ def _split_questions_vision(state: WorkflowState) -> dict:
         from pipeline.vision_ocr_client import VisionOCRClient
 
         console.print(f"[cyan]视觉识别 {len(file_paths)} 个文件...[/cyan]")
+        emitter.emit(
+            step="vision_load",
+            stage="加载页面",
+            message=f"开始视觉识别：{len(file_paths)} 个文件，正在加载页面…",
+            progress=0.0,
+        )
+        # 视觉调用发生在科目识别之前，无法按科目过滤，只能把全量知识点标签交给模型自行匹配复用
+        _, db_tags = _load_db_context()
+        existing_tags = ",".join(db_tags)
         started = time.time()
         try:
             result = VisionOCRClient(
                 api_key=creds.get("api_key"),
                 base_url=creds.get("base_url") or "",
                 model=creds.get("model") or "deepseek-flash",
-            ).parse_document(file_paths, output_dir=results_dir)
+            ).parse_document(
+                file_paths, output_dir=results_dir, emitter=emitter, existing_tags=existing_tags
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("视觉 OCR 失败: %s\n%s", exc, traceback.format_exc())
+            emitter.emit(
+                step="vision_load",
+                stage="加载页面",
+                level="error",
+                message=f"视觉识别失败：{exc}",
+            )
             return {
                 "questions": [],
                 "warnings": [
@@ -814,12 +822,31 @@ def _split_questions_vision(state: WorkflowState) -> dict:
             len(result.get("pages") or []),
             time.time() - started,
         )
+        emitter.emit(
+            step="vision_merge",
+            stage="汇总结果",
+            level="success",
+            message=f"视觉识别完成：{len(result.get('pages') or [])} 页、{len(result.get('questions') or [])} 道题目，耗时 {time.time() - started:.1f}s",
+            progress=1.0,
+        )
 
     questions = result.get("questions") or []
     for index, question in enumerate(questions):
         question["uid"] = str(index)
-    # 配图落地（裁剪图 + 整页图）：新识别与 ocr_cache 复用走同一套逻辑
+    # 题目图片落地：每题保留其所有页的整页原图（跨页题目保留两张）
+    emitter.emit(
+        step="materialize",
+        stage="配图",
+        message=f"正在为 {len(questions)} 道题目准备页面配图…",
+    )
     _materialize_question_images(questions, result.get("pages") or [])
+    emitter.emit(
+        step="materialize",
+        stage="配图",
+        level="success",
+        message=f"配图完成：{len(questions)} 道题目",
+        progress=1.0,
+    )
 
     with open(os.path.join(results_dir, "agent_input.json"), "w", encoding="utf-8") as f:
         json.dump(result.get("pages") or [], f, ensure_ascii=False, indent=2)
@@ -838,12 +865,25 @@ def _split_questions_vision(state: WorkflowState) -> dict:
             json.dump({"subject": subject}, f, ensure_ascii=False, indent=2)
 
     if not questions:
+        emitter.emit(
+            step="split",
+            stage="分割题目",
+            level="error",
+            message="未能从图片中识别出题目，请确认图片内容包含试题",
+        )
         return {
             "questions": [],
             "warnings": ["步骤 2（视觉 OCR）失败：未能从图片中识别出题目，请确认图片内容包含试题"],
         }
 
     console.print(f"[green][OK] 视觉识别完成: {len(questions)} 道题目[/green]")
+    emitter.emit(
+        step="split",
+        stage="分割题目",
+        level="success",
+        message=f"分割完成：共 {len(questions)} 道题目（含标记的作答与批改信息）",
+        progress=1.0,
+    )
     return {"questions": questions, "ocr_data": result.get("pages") or []}
 
 
@@ -1073,9 +1113,11 @@ def correct_questions_node(state: WorkflowState) -> dict:
     console.print("[bold yellow]步骤 2.5: OCR 纠错检查[/bold yellow]")
     step_start = time.time()
 
+    emitter = EventEmitter(state.get("task_id"))
     questions = state.get("questions", [])
     if not questions:
         logger.info("纠错跳过: 无题目")
+        emitter.emit(step="correct", stage="纠错", level="success", message="没有题目，跳过纠错")
         return {"questions": questions}
 
     # 筛选需要纠错的题目
@@ -1084,10 +1126,21 @@ def correct_questions_node(state: WorkflowState) -> dict:
     if not flagged:
         logger.info("纠错跳过: 无需纠错的题目")
         console.print("[green][OK] 所有题目均无 OCR 错误标记，跳过纠错[/green]")
+        emitter.emit(
+            step="correct",
+            stage="纠错",
+            level="success",
+            message=f"无需纠错：{len(questions)} 道题目都没有 OCR 错误标记",
+        )
         return {"questions": questions}
 
     console.print(f"[cyan]发现 {len(flagged)} 道题目需要纠错（共 {len(questions)} 道）[/cyan]")
     logger.info(f"开始纠错: {len(flagged)}/{len(questions)} 道题目")
+    emitter.emit(
+        step="correct",
+        stage="纠错",
+        message=f"发现 {len(flagged)}/{len(questions)} 道题目需要纠错，正在调用模型…",
+    )
 
     # 加载 OCR 数据作为纠错上下文
     # agent_input.json 现在保存的是批次数据（[[page, ...], ...]），需要还原为扁平页面列表
@@ -1132,6 +1185,12 @@ def correct_questions_node(state: WorkflowState) -> dict:
     except (json.JSONDecodeError, TypeError):
         logger.error(f"纠错结果解析失败: {result_str[:200]}")
         console.print("[red][WARN] 纠错结果解析失败，保留原始题目[/red]")
+        emitter.emit(
+            step="correct",
+            stage="纠错",
+            level="warn",
+            message="纠错结果解析失败，保留原始题目",
+        )
         return {"questions": questions}
 
     # 按 (section_title, question_id) 复合键合并纠错结果，避免不同大题同号题互相覆盖
@@ -1167,6 +1226,13 @@ def correct_questions_node(state: WorkflowState) -> dict:
 
     logger.info(f"纠错完成: {len(corrected)}/{len(flagged)} 道题目已修复，耗时 {time.time() - step_start:.2f}s")
     console.print(f"[green][OK] 纠错完成: {len(corrected)} 道题目已修复[/green]")
+    emitter.emit(
+        step="correct",
+        stage="纠错",
+        level="success",
+        message=f"纠错完成：修复 {len(corrected)}/{len(flagged)} 道题目，耗时 {time.time() - step_start:.1f}s",
+        progress=1.0,
+    )
 
     return {"questions": merged}
 
@@ -1175,10 +1241,19 @@ def export_node(state: WorkflowState) -> dict:
     """节点: 导出错题本"""
     console.print("[bold yellow]步骤 3: 导出错题本[/bold yellow]")
     step_start = time.time()
+    emitter = EventEmitter(state.get("task_id"))
+    emitter.emit(step="export", stage="导出", message="正在生成错题本文件…")
     results_dir = state.get("results_dir") or settings.results_dir
     output_path = state.get("output_path") or os.path.join(results_dir, "wrongbook.md")
     output_path = export_wrongbook(state["questions"], state["selected_ids"], output_path=output_path)
     logger.info(f"导出完成: {output_path}，耗时 {time.time() - step_start:.2f}s")
+    emitter.emit(
+        step="export",
+        stage="导出",
+        level="success",
+        message=f"导出完成：{os.path.basename(output_path)}，耗时 {time.time() - step_start:.1f}s",
+        progress=1.0,
+    )
     return {"output_path": output_path}
 
 

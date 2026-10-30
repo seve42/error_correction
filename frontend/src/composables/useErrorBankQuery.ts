@@ -16,15 +16,18 @@ type ErrorBankFilters = {
   review_status: string
 }
 
-type ErrorBankQueryParams = {
-  page: number
-  page_size: number
+type ErrorBankFilterParams = {
   project_id: Id
   subject?: string[]
   knowledge_tag?: string[]
   question_type?: string[]
   keyword?: string
   review_status?: string
+}
+
+type ErrorBankQueryParams = ErrorBankFilterParams & {
+  page: number
+  page_size: number
 }
 
 export function useErrorBankQuery({ activeQuestionProjectId, pushToast, typesetMath }: UseErrorBankQueryOptions) {
@@ -58,6 +61,16 @@ export function useErrorBankQuery({ activeQuestionProjectId, pushToast, typesetM
 
   const reviewStatusOptions = ['待复习', '复习中', '已掌握']
 
+  const buildFilterParams = (): ErrorBankFilterParams => {
+    const params: ErrorBankFilterParams = { project_id: activeQuestionProjectId.value }
+    if (filters.subject?.length) params.subject = filters.subject
+    if (filters.knowledge_tag?.length) params.knowledge_tag = filters.knowledge_tag
+    if (filters.question_type?.length) params.question_type = filters.question_type
+    if (filters.keyword) params.keyword = filters.keyword
+    if (filters.review_status) params.review_status = filters.review_status
+    return params
+  }
+
   const doQuery = async () => {
     if (!activeQuestionProjectId.value) {
       items.value = []
@@ -70,12 +83,7 @@ export function useErrorBankQuery({ activeQuestionProjectId, pushToast, typesetM
     }
     loading.value = true
     try {
-      const params: ErrorBankQueryParams = { page: page.value, page_size: pageSize.value, project_id: activeQuestionProjectId.value }
-      if (filters.subject?.length) params.subject = filters.subject
-      if (filters.knowledge_tag?.length) params.knowledge_tag = filters.knowledge_tag
-      if (filters.question_type?.length) params.question_type = filters.question_type
-      if (filters.keyword) params.keyword = filters.keyword
-      if (filters.review_status) params.review_status = filters.review_status
+      const params: ErrorBankQueryParams = { page: page.value, page_size: pageSize.value, ...buildFilterParams() }
 
       const data = await api.fetchErrorBank(params)
       items.value = data.items || []
@@ -85,6 +93,12 @@ export function useErrorBankQuery({ activeQuestionProjectId, pushToast, typesetM
 
       if (!items.value.some(q => String(q.id) === String(activeQuestionId.value))) {
         activeQuestionId.value = items.value[0]?.id || null
+      }
+
+      // 删除题目后当前页可能超出范围，回退到最后一页再查一次
+      if (page.value > 1 && (totalPages.value === 0 || page.value > totalPages.value)) {
+        page.value = Math.max(1, totalPages.value)
+        await doQuery()
       }
     } catch (error) {
       pushToast('error', error instanceof Error ? error.message : String(error))
@@ -171,6 +185,7 @@ export function useErrorBankQuery({ activeQuestionProjectId, pushToast, typesetM
     optionList,
     knowledgeTags,
     reviewStatusOptions,
+    buildFilterParams,
     doQuery,
     loadFilters,
     refreshTags,

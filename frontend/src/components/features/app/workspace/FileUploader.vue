@@ -20,6 +20,10 @@ const props = defineProps({
   selectedLlmOptionId: { type: String, default: '' },
   noModels: { type: Boolean, default: false },
   statusLoading: { type: Boolean, default: false },
+  // 聚合上传进度：几百张图分批并发时，用户需要看到整体位置而不是单个文件的细粒度进度
+  uploadPercent: { type: Number, default: 0 },
+  uploadDone: { type: Number, default: 0 },
+  uploadTotal: { type: Number, default: 0 },
 })
 
 const emit = defineEmits(['upload', 'remove-file', 'update:selected-llm-option-id'])
@@ -81,7 +85,7 @@ const onClickZone = () => {
             支持PDF/PNG/JPG/BMP/TIF等各种图片格式
           </p>
           <p class="mt-1 text-xs text-gray-400 dark:text-[#62666d]">
-            单文件≤50MB&1000页 · 单图片≤10MB · 批量上传≤20个
+            单文件≤50MB&1000页 · 单图片≤10MB · 批量自动分批上传
           </p>
         </div>
 
@@ -107,6 +111,20 @@ const onClickZone = () => {
         multiple
         @change="onFileInput"
       />
+    </div>
+
+    <!-- 总体上传进度：所有文件平均值，几十批并发时仍能看出整体完成度 -->
+    <div v-if="uploadTotal > 0" class="mt-3 w-full">
+      <div class="flex items-center justify-between text-[11px] text-gray-500 dark:text-[#8a8f98]">
+        <span>已上传 {{ uploadDone }}/{{ uploadTotal }} · {{ uploadPercent }}%</span>
+        <span>{{ uploadBusy ? '上传中…' : '上传完成' }}</span>
+      </div>
+      <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-gray-200/80 dark:bg-white/[0.08]">
+        <div
+          class="h-full rounded-full accent-bg transition-[width] duration-300 ease-out"
+          :style="{ width: uploadPercent + '%' }"
+        ></div>
+      </div>
     </div>
   </div>
 </template>
